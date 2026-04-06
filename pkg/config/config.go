@@ -341,6 +341,15 @@ type WhatsAppConfig struct {
 	SessionStorePath   string              `json:"session_store_path"   yaml:"-" env:"PICOCLAW_CHANNELS_WHATSAPP_SESSION_STORE_PATH"`
 	AllowFrom          FlexibleStringSlice `json:"allow_from"           yaml:"-" env:"PICOCLAW_CHANNELS_WHATSAPP_ALLOW_FROM"`
 	ReasoningChannelID string              `json:"reasoning_channel_id" yaml:"-" env:"PICOCLAW_CHANNELS_WHATSAPP_REASONING_CHANNEL_ID"`
+	Pool               WhatsAppPoolConfig  `json:"pool"                 yaml:"-"`
+}
+
+// WhatsAppPoolConfig controls multi-instance WhatsApp pool mode.
+// When enabled, the gateway manages multiple WhatsApp slots (whatsapp_1, whatsapp_2, ...)
+// each with its own session store and Signal encryption keys.
+type WhatsAppPoolConfig struct {
+	Enabled  bool `json:"enabled"   env:"PICOCLAW_CHANNELS_WHATSAPP_POOL_ENABLED"`
+	MaxSlots int  `json:"max_slots" env:"PICOCLAW_CHANNELS_WHATSAPP_POOL_MAX_SLOTS"`
 }
 
 type TelegramConfig struct {

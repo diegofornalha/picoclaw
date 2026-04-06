@@ -46,6 +46,7 @@ func DefaultConfig() *Config {
 				UseNative:        false,
 				SessionStorePath: "",
 				AllowFrom:        FlexibleStringSlice{},
+				Pool:             WhatsAppPoolConfig{Enabled: false, MaxSlots: 10},
 			},
 			Telegram: TelegramConfig{
 				Enabled:   false,
