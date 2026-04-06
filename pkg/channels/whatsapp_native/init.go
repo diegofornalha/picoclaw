@@ -15,6 +15,6 @@ func init() {
 		if storePath == "" {
 			storePath = filepath.Join(cfg.WorkspacePath(), "whatsapp")
 		}
-		return NewWhatsAppNativeChannel(waCfg, b, storePath)
+		return NewWhatsAppNativeChannel("whatsapp_native", waCfg, b, storePath)
 	})
 }

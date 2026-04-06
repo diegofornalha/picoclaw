@@ -68,6 +68,7 @@ type services struct {
 	DeviceService    *devices.Service
 	HealthServer     *health.Server
 	VoiceAgentCancel context.CancelFunc
+	WAPool           *whatsappnative.WhatsAppPool // nil when pool mode is disabled
 	manualReloadChan chan struct{}
 	reloading        atomic.Bool
 	authToken        string
@@ -363,6 +364,27 @@ func setupAndStartServices(
 		return nil, fmt.Errorf("error creating channel manager: %w", err)
 	}
 
+	// Initialize WhatsApp pool if enabled (before StartAll so slots are registered)
+	if cfg.Channels.WhatsApp.Enabled && cfg.Channels.WhatsApp.UseNative && cfg.Channels.WhatsApp.Pool.Enabled {
+		basePath := filepath.Join(cfg.WorkspacePath(), "whatsapp")
+		pool := whatsappnative.NewWhatsAppPool(
+			cfg.Channels.WhatsApp,
+			msgBus,
+			basePath,
+			cfg.Channels.WhatsApp.Pool.MaxSlots,
+		)
+		poolChannels, poolErr := pool.Start(context.Background())
+		if poolErr != nil {
+			logger.ErrorCF("gateway", "WhatsApp pool start failed", map[string]any{"error": poolErr.Error()})
+		} else {
+			for name, ch := range poolChannels {
+				runningServices.ChannelManager.RegisterChannel(name, ch)
+			}
+			runningServices.WAPool = pool
+			fmt.Printf("✓ WhatsApp pool enabled with %d slot(s)\n", len(poolChannels))
+		}
+	}
+
 	agentLoop.SetChannelManager(runningServices.ChannelManager)
 	agentLoop.SetMediaStore(runningServices.MediaStore)
 
@@ -399,22 +421,88 @@ func setupAndStartServices(
 			http.Error(w, "bad request: text required", http.StatusBadRequest)
 			return
 		}
-		ch, ok := runningServices.ChannelManager.GetChannel("whatsapp_native")
-		if !ok {
+		// Try single-instance first, then pool slots
+		type statusSender interface {
+			SendStatus(ctx context.Context, text string) error
+		}
+		var sender statusSender
+		if ch, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if s, ok := ch.(statusSender); ok {
+				sender = s
+			}
+		}
+		if sender == nil && runningServices.WAPool != nil {
+			for _, slot := range runningServices.WAPool.ConnectedSlots() {
+				sender = slot.Channel
+				break
+			}
+		}
+		if sender == nil {
 			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
 			return
 		}
-		waCh, ok := ch.(*whatsappnative.WhatsAppNativeChannel)
-		if !ok {
-			http.Error(w, "whatsapp channel type mismatch", http.StatusInternalServerError)
-			return
-		}
-		if err := waCh.SendStatus(r.Context(), body.Text); err != nil {
+		if err := sender.SendStatus(r.Context(), body.Text); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: WhatsApp pool status
+	runningServices.ChannelManager.HandleFunc("/api/whatsapp/pool/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if runningServices.WAPool == nil {
+			http.Error(w, "whatsapp pool not enabled", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"slots": runningServices.WAPool.GetSlotStatuses(),
+		})
+	})
+
+	// API: WhatsApp pool QR events (Server-Sent Events)
+	runningServices.ChannelManager.HandleFunc("/api/whatsapp/pool/qr", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if runningServices.WAPool == nil {
+			http.Error(w, "whatsapp pool not enabled", http.StatusServiceUnavailable)
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		flusher.Flush()
+
+		ctx := r.Context()
+		qrCh := runningServices.WAPool.QREvents()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-qrCh:
+				if !ok {
+					return
+				}
+				data, _ := json.Marshal(evt)
+				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.Event, data)
+				flusher.Flush()
+			}
+		}
 	})
 
 	if err = runningServices.ChannelManager.StartAll(context.Background()); err != nil {
@@ -457,6 +545,9 @@ func stopAndCleanupServices(runningServices *services, shutdownTimeout time.Dura
 	defer shutdownCancel()
 
 	// reload should not stop channel manager
+	if !isReload && runningServices.WAPool != nil {
+		runningServices.WAPool.Stop(shutdownCtx)
+	}
 	if !isReload && runningServices.ChannelManager != nil {
 		runningServices.ChannelManager.StopAll(shutdownCtx)
 	}

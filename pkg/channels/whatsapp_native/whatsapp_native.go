@@ -62,16 +62,31 @@ type WhatsAppNativeChannel struct {
 	stopping     atomic.Bool    // set once Stop begins; prevents new wg.Add calls
 	loggedOut    atomic.Bool    // set when session is permanently invalid (LoggedOut, StreamReplaced, etc.)
 	wg           sync.WaitGroup // tracks background goroutines (QR handler, reconnect)
+
+	// QRCallback is an optional hook called when QR login events occur.
+	// Used by the WhatsApp pool to intercept QR codes for the web UI.
+	// Parameters: event ("code", "timeout", etc.) and code (QR data, only for "code" event).
+	QRCallback func(event, code string)
+
+	// OnDisconnect is an optional hook called when the WhatsApp connection drops.
+	// Used by the WhatsApp pool to re-queue the slot for pairing.
+	OnDisconnect func()
+
+	// IgnoreNumbers is a set of phone numbers (without @s.whatsapp.net) to ignore.
+	// Used by the pool to prevent bot numbers from talking to each other.
+	IgnoreNumbers map[string]bool
 }
 
 // NewWhatsAppNativeChannel creates a WhatsApp channel that uses whatsmeow for connection.
+// name is the channel identifier (e.g. "whatsapp_native" or "whatsapp_1" for pool mode).
 // storePath is the directory for the SQLite session store (e.g. workspace/whatsapp).
 func NewWhatsAppNativeChannel(
+	name string,
 	cfg config.WhatsAppConfig,
 	bus *bus.MessageBus,
 	storePath string,
 ) (channels.Channel, error) {
-	base := channels.NewBaseChannel("whatsapp_native", cfg, bus, cfg.AllowFrom, channels.WithMaxMessageLength(65536))
+	base := channels.NewBaseChannel(name, cfg, bus, cfg.AllowFrom, channels.WithMaxMessageLength(65536))
 	if storePath == "" {
 		storePath = "whatsapp"
 	}
@@ -190,6 +205,9 @@ func (c *WhatsAppNativeChannel) Start(ctx context.Context) error {
 						return
 					}
 					if evt.Event == "code" {
+						if c.QRCallback != nil {
+							c.QRCallback("code", evt.Code)
+						}
 						logger.InfoCF("whatsapp", "Scan this QR code with WhatsApp (Linked Devices):", nil)
 						qrterminal.GenerateWithConfig(evt.Code, qrterminal.Config{
 							Level:      qrterminal.L,
@@ -197,6 +215,9 @@ func (c *WhatsAppNativeChannel) Start(ctx context.Context) error {
 							HalfBlocks: true,
 						})
 					} else {
+						if c.QRCallback != nil {
+							c.QRCallback(evt.Event, "")
+						}
 						logger.InfoCF("whatsapp", "WhatsApp login event", map[string]any{"event": evt.Event})
 					}
 				}
@@ -311,6 +332,9 @@ func (c *WhatsAppNativeChannel) eventHandler(evt any) {
 		c.loggedOut.Store(true)
 		logger.ErrorCF("whatsapp", "WhatsApp client outdated — update whatsmeow required", nil)
 	case *events.Disconnected:
+		if c.OnDisconnect != nil {
+			c.OnDisconnect()
+		}
 		logger.InfoCF("whatsapp", "WhatsApp disconnected, will attempt reconnection", nil)
 		c.reconnectMu.Lock()
 		if c.reconnecting {
@@ -389,13 +413,37 @@ func (c *WhatsAppNativeChannel) handleIncoming(evt *events.Message) {
 	if evt.Message == nil {
 		return
 	}
+
+	// Ignore messages from self (own device)
+	if evt.Info.IsFromMe {
+		return
+	}
+
 	senderID := evt.Info.Sender.String()
 	chatID := evt.Info.Chat.String()
+
+	// Ignore group messages entirely — bot should be silent in groups
+	if evt.Info.Chat.Server == types.GroupServer {
+		return
+	}
+
+	// Ignore messages from other bot numbers in the pool
+	if len(c.IgnoreNumbers) > 0 {
+		senderPhone := evt.Info.Sender.User
+		if c.IgnoreNumbers[senderPhone] {
+			return
+		}
+	}
 	content := evt.Message.GetConversation()
 	if content == "" && evt.Message.ExtendedTextMessage != nil {
 		content = evt.Message.ExtendedTextMessage.GetText()
 	}
 	content = utils.SanitizeMessageContent(content)
+
+	// Ignore own placeholder messages ("Buscando... ⏳" / "Buscando... ⌛")
+	if strings.HasPrefix(content, "Buscando...") {
+		return
+	}
 
 	if content == "" {
 		return
@@ -551,9 +599,9 @@ func (c *WhatsAppNativeChannel) SendStatus(ctx context.Context, text string) err
 }
 
 // SendMedia implements the channels.MediaSender interface.
-func (c *WhatsAppNativeChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {
+func (c *WhatsAppNativeChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) ([]string, error) {
 	if !c.IsRunning() {
-		return channels.ErrNotRunning
+		return nil, channels.ErrNotRunning
 	}
 
 	c.mu.Lock()
@@ -561,28 +609,28 @@ func (c *WhatsAppNativeChannel) SendMedia(ctx context.Context, msg bus.OutboundM
 	c.mu.Unlock()
 
 	if client == nil || !client.IsConnected() {
-		return fmt.Errorf("whatsapp connection not established: %w", channels.ErrTemporary)
+		return nil, fmt.Errorf("whatsapp connection not established: %w", channels.ErrTemporary)
 	}
 	if client.Store.ID == nil {
-		return fmt.Errorf("whatsapp not yet paired (QR login pending): %w", channels.ErrTemporary)
+		return nil, fmt.Errorf("whatsapp not yet paired (QR login pending): %w", channels.ErrTemporary)
 	}
 
 	to, err := parseJID(msg.ChatID)
 	if err != nil {
-		return fmt.Errorf("invalid chat id %q: %w", msg.ChatID, channels.ErrSendFailed)
+		return nil, fmt.Errorf("invalid chat id %q: %w", msg.ChatID, channels.ErrSendFailed)
 	}
 
 	store := c.GetMediaStore()
 	if store == nil {
-		return fmt.Errorf("no media store available: %w", channels.ErrSendFailed)
+		return nil, fmt.Errorf("no media store available: %w", channels.ErrSendFailed)
 	}
 
 	for _, part := range msg.Parts {
 		if err := c.sendMediaPart(ctx, client, to, store, part); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // sendMediaPart uploads and sends a single media part via whatsmeow.
@@ -816,7 +864,7 @@ func (c *WhatsAppNativeChannel) DeleteMessage(ctx context.Context, chatID, messa
 	return err
 }
 
-// ReactToMessage adds a 👀 reaction to an inbound message.
+// ReactToMessage adds a ⏳ reaction to an inbound message.
 // The returned undo function removes the reaction (idempotent).
 func (c *WhatsAppNativeChannel) ReactToMessage(ctx context.Context, chatID, messageID string) (func(), error) {
 	jid, err := parseJID(chatID)
@@ -831,7 +879,7 @@ func (c *WhatsAppNativeChannel) ReactToMessage(ctx context.Context, chatID, mess
 		return func() {}, nil
 	}
 
-	reaction := client.BuildReaction(jid, types.EmptyJID, types.MessageID(messageID), "👀")
+	reaction := client.BuildReaction(jid, types.EmptyJID, types.MessageID(messageID), "⏳")
 	_, _ = client.SendMessage(ctx, jid, reaction)
 
 	var once sync.Once
@@ -851,6 +899,7 @@ func (c *WhatsAppNativeChannel) ReactToMessage(ctx context.Context, chatID, mess
 
 // SendPlaceholder sends a temporary "thinking" message and returns its ID
 // so it can be edited later with the real response.
+// It animates the placeholder text (⏳/⌛) every 3 seconds until replaced.
 func (c *WhatsAppNativeChannel) SendPlaceholder(ctx context.Context, chatID string) (string, error) {
 	jid, err := parseJID(chatID)
 	if err != nil {
@@ -869,7 +918,38 @@ func (c *WhatsAppNativeChannel) SendPlaceholder(ctx context.Context, chatID stri
 	if err != nil {
 		return "", err
 	}
-	return resp.ID, nil
+
+	// Animate placeholder: alternate ⏳/⌛ every 3 seconds
+	msgID := resp.ID
+	go func() {
+		frames := []string{"Buscando... ⌛", "Buscando... ⏳"}
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				c.mu.Lock()
+				cl := c.client
+				c.mu.Unlock()
+				if cl == nil {
+					return
+				}
+				text := frames[i%len(frames)]
+				edited := cl.BuildEdit(jid, types.MessageID(msgID), &waE2E.Message{
+					Conversation: proto.String(text),
+				})
+				if _, err := cl.SendMessage(ctx, jid, edited); err != nil {
+					return // stop animating on error
+				}
+				i++
+			}
+		}
+	}()
+
+	return msgID, nil
 }
 
 // IsOnWhatsApp checks if a phone number is registered on WhatsApp.

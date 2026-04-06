@@ -294,7 +294,9 @@ func (c *BaseChannel) HandleMessage(
 	// If streaming actually activates, preSend will skip the placeholder edit (streamActive map)
 	// and the typing stop will still be called. This avoids the problem of compile-time interface
 	// checks incorrectly skipping indicators when streaming may not work at runtime.
-	if c.owner != nil && c.placeholderRecorder != nil {
+	// Skip all indicators for group chats (chatID contains @g.us).
+	isGroup := strings.Contains(chatID, "@g.us")
+	if c.owner != nil && c.placeholderRecorder != nil && !isGroup {
 		// Typing
 		if tc, ok := c.owner.(TypingCapable); ok {
 			if stop, err := tc.StartTyping(ctx, chatID); err == nil {
@@ -308,10 +310,13 @@ func (c *BaseChannel) HandleMessage(
 			}
 		}
 		// Placeholder — independent pipeline.
+		// Skip for slash commands (e.g. /clear, /link-magico) — they are fast operations
+		// that don't need a placeholder, and /clear would leave it orphaned.
 		// Skip when the message contains audio: the agent will send the
 		// placeholder after transcription completes, so the user sees
 		// "Thinking…" only once the voice has been processed.
-		if !audioAnnotationRe.MatchString(content) {
+		isCommand := strings.HasPrefix(strings.TrimSpace(content), "/")
+		if !isCommand && !audioAnnotationRe.MatchString(content) {
 			if pc, ok := c.owner.(PlaceholderCapable); ok {
 				if phID, err := pc.SendPlaceholder(ctx, chatID); err == nil && phID != "" {
 					c.placeholderRecorder.RecordPlaceholder(c.name, chatID, phID)

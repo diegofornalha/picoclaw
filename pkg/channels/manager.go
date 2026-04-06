@@ -360,9 +360,10 @@ func (m *Manager) initChannels(channels *config.ChannelsConfig) error {
 
 	if channels.WhatsApp.Enabled {
 		waCfg := channels.WhatsApp
-		if waCfg.UseNative {
+		if waCfg.UseNative && !waCfg.Pool.Enabled {
+			// Single instance mode (pool mode is handled by gateway)
 			m.initChannel("whatsapp_native", "WhatsApp Native")
-		} else if waCfg.BridgeURL != "" {
+		} else if !waCfg.UseNative && waCfg.BridgeURL != "" {
 			m.initChannel("whatsapp", "WhatsApp")
 		}
 	}
@@ -1166,6 +1167,18 @@ func (m *Manager) Reload(ctx context.Context, cfg *config.Config) error {
 func (m *Manager) RegisterChannel(name string, channel Channel) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Inject dependencies (same as initChannel)
+	if m.mediaStore != nil {
+		if setter, ok := channel.(interface{ SetMediaStore(s media.MediaStore) }); ok {
+			setter.SetMediaStore(m.mediaStore)
+		}
+	}
+	if setter, ok := channel.(interface{ SetPlaceholderRecorder(r PlaceholderRecorder) }); ok {
+		setter.SetPlaceholderRecorder(m)
+	}
+	if setter, ok := channel.(interface{ SetOwner(ch Channel) }); ok {
+		setter.SetOwner(channel)
+	}
 	m.channels[name] = channel
 	if m.mux != nil {
 		m.registerChannelHTTPHandler(name, channel)
