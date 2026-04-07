@@ -440,10 +440,6 @@ func (c *WhatsAppNativeChannel) handleIncoming(evt *events.Message) {
 	}
 	content = utils.SanitizeMessageContent(content)
 
-	// Ignore own placeholder messages ("Buscando... ⏳" / "Buscando... ⌛")
-	if strings.HasPrefix(content, "Buscando...") {
-		return
-	}
 
 	if content == "" {
 		return
@@ -897,60 +893,6 @@ func (c *WhatsAppNativeChannel) ReactToMessage(ctx context.Context, chatID, mess
 	return undo, nil
 }
 
-// SendPlaceholder sends a temporary "thinking" message and returns its ID
-// so it can be edited later with the real response.
-// It animates the placeholder text (⏳/⌛) every 3 seconds until replaced.
-func (c *WhatsAppNativeChannel) SendPlaceholder(ctx context.Context, chatID string) (string, error) {
-	jid, err := parseJID(chatID)
-	if err != nil {
-		return "", fmt.Errorf("placeholder: %w", err)
-	}
-
-	c.mu.Lock()
-	client := c.client
-	c.mu.Unlock()
-	if client == nil {
-		return "", fmt.Errorf("whatsapp not connected")
-	}
-
-	msg := &waE2E.Message{Conversation: proto.String("Buscando... ⏳")}
-	resp, err := client.SendMessage(ctx, jid, msg)
-	if err != nil {
-		return "", err
-	}
-
-	// Animate placeholder: alternate ⏳/⌛ every 3 seconds
-	msgID := resp.ID
-	go func() {
-		frames := []string{"Buscando... ⌛", "Buscando... ⏳"}
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		i := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				c.mu.Lock()
-				cl := c.client
-				c.mu.Unlock()
-				if cl == nil {
-					return
-				}
-				text := frames[i%len(frames)]
-				edited := cl.BuildEdit(jid, types.MessageID(msgID), &waE2E.Message{
-					Conversation: proto.String(text),
-				})
-				if _, err := cl.SendMessage(ctx, jid, edited); err != nil {
-					return // stop animating on error
-				}
-				i++
-			}
-		}
-	}()
-
-	return msgID, nil
-}
 
 // IsOnWhatsApp checks if a phone number is registered on WhatsApp.
 func (c *WhatsAppNativeChannel) IsOnWhatsApp(ctx context.Context, phone string) (bool, error) {
