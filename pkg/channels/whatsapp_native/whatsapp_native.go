@@ -476,7 +476,7 @@ func (c *WhatsAppNativeChannel) handleIncoming(evt *events.Message) {
 	if evt.Info.Chat.Server == types.GroupServer {
 		// Skip group messages when mention_only is enabled — prevents
 		// data leaks (magic links, subscriber info) in public groups.
-		if c.cfg.GroupTrigger.MentionOnly {
+		if c.config.GroupTrigger.MentionOnly {
 			logger.DebugCF("whatsapp", "ignoring group message (mention_only)", map[string]any{"chat": chatID})
 			return
 		}
