@@ -2,16 +2,24 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/sipeed/picoclaw/pkg/agent"
+	"github.com/sipeed/picoclaw/pkg/audio/asr"
+	"github.com/sipeed/picoclaw/pkg/audio/tts"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/channels"
 	_ "github.com/sipeed/picoclaw/pkg/channels/dingtalk"
@@ -21,14 +29,16 @@ import (
 	_ "github.com/sipeed/picoclaw/pkg/channels/line"
 	_ "github.com/sipeed/picoclaw/pkg/channels/maixcam"
 	_ "github.com/sipeed/picoclaw/pkg/channels/onebot"
-	_ "github.com/sipeed/picoclaw/pkg/channels/pico"
+	"github.com/sipeed/picoclaw/pkg/channels/pico"
 	_ "github.com/sipeed/picoclaw/pkg/channels/qq"
 	_ "github.com/sipeed/picoclaw/pkg/channels/slack"
+	_ "github.com/sipeed/picoclaw/pkg/channels/teams_webhook"
 	_ "github.com/sipeed/picoclaw/pkg/channels/telegram"
+	_ "github.com/sipeed/picoclaw/pkg/channels/vk"
 	_ "github.com/sipeed/picoclaw/pkg/channels/wecom"
 	_ "github.com/sipeed/picoclaw/pkg/channels/weixin"
 	_ "github.com/sipeed/picoclaw/pkg/channels/whatsapp"
-	_ "github.com/sipeed/picoclaw/pkg/channels/whatsapp_native"
+	whatsappnative "github.com/sipeed/picoclaw/pkg/channels/whatsapp_native"
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/cron"
 	"github.com/sipeed/picoclaw/pkg/devices"
@@ -36,10 +46,10 @@ import (
 	"github.com/sipeed/picoclaw/pkg/heartbeat"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
+	"github.com/sipeed/picoclaw/pkg/pid"
 	"github.com/sipeed/picoclaw/pkg/providers"
 	"github.com/sipeed/picoclaw/pkg/state"
 	"github.com/sipeed/picoclaw/pkg/tools"
-	"github.com/sipeed/picoclaw/pkg/voice"
 )
 
 const (
@@ -59,12 +69,36 @@ type services struct {
 	ChannelManager   *channels.Manager
 	DeviceService    *devices.Service
 	HealthServer     *health.Server
+	VoiceAgentCancel context.CancelFunc
+	WAPool           *whatsappnative.WhatsAppPool // nil when pool mode is disabled
 	manualReloadChan chan struct{}
 	reloading        atomic.Bool
+	authToken        string
 }
 
 type startupBlockedProvider struct {
 	reason string
+}
+
+func logChannelVoiceCapabilities(cm *channels.Manager, asrAvailable bool, ttsAvailable bool) {
+	if cm == nil {
+		return
+	}
+
+	names := cm.GetEnabledChannels()
+	sort.Strings(names)
+	for _, name := range names {
+		ch, ok := cm.GetChannel(name)
+		if !ok {
+			continue
+		}
+		caps := channels.DetectVoiceCapabilities(name, ch, asrAvailable, ttsAvailable)
+		logger.InfoCF("voice", "Channel voice capabilities", map[string]any{
+			"channel": name,
+			"asr":     caps.ASR,
+			"tts":     caps.TTS,
+		})
+	}
 }
 
 func (p *startupBlockedProvider) Chat(
@@ -91,21 +125,41 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 	defer panicFunc()
 
 	if err = logger.EnableFileLogging(filepath.Join(homePath, logPath, logFile)); err != nil {
-		panic(fmt.Sprintf("error enabling file logging: %v", err))
+		logger.Fatal(fmt.Sprintf("error enabling file logging: %v", err))
 	}
 	defer logger.DisableFileLogging()
 
-	cfg, err := config.LoadConfig(configPath)
-	if err != nil {
-		return fmt.Errorf("error loading config: %w", err)
-	}
-
-	logger.SetLevelFromString(cfg.Gateway.LogLevel)
-
 	if debug {
 		logger.SetLevel(logger.DEBUG)
-		fmt.Println("🔍 Debug mode enabled")
+	} else {
+		logger.SetLevelFromString(config.ResolveGatewayLogLevel(configPath))
 	}
+
+	cfg, err := config.LoadConfig(configPath)
+	if err != nil {
+		logger.Fatalf("error loading config: %v", err)
+	}
+
+	if err = preCheckConfig(cfg); err != nil {
+		logger.Fatalf("config pre-check failed: %v", err)
+	}
+
+	// Debug mode permanently overrides the config log level to DEBUG.
+	if debug {
+		fmt.Println("🔍 Debug mode enabled")
+	} else {
+		effectiveLogLevel := config.EffectiveGatewayLogLevel(cfg)
+		logger.SetLevelFromString(effectiveLogLevel)
+		logger.Infof("Log level set to %q", effectiveLogLevel)
+	}
+
+	// Enforce singleton: write PID file with generated token.
+	pidData, err := pid.WritePidFile(homePath, cfg.Gateway.Host, cfg.Gateway.Port)
+	if err != nil {
+		logger.Warnf("write pid file failed: %v", err)
+		return fmt.Errorf("singleton check failed: %w", err)
+	}
+	defer pid.RemovePidFile(homePath)
 
 	provider, modelID, err := createStartupProvider(cfg, allowEmptyStartup)
 	if err != nil {
@@ -133,7 +187,7 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 			"skills_available": skillsInfo["available"],
 		})
 
-	runningServices, err := setupAndStartServices(cfg, agentLoop, msgBus)
+	runningServices, err := setupAndStartServices(cfg, agentLoop, msgBus, pidData.Token)
 	if err != nil {
 		return err
 	}
@@ -187,7 +241,7 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 				logger.Warn("Config reload skipped: another reload is in progress")
 				continue
 			}
-			err := executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup)
+			err := executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup, debug)
 			if err != nil {
 				logger.Errorf("Config reload failed: %v", err)
 			}
@@ -204,7 +258,7 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 				runningServices.reloading.Store(false)
 				continue
 			}
-			err = executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup)
+			err = executeReload(ctx, agentLoop, newCfg, &provider, runningServices, msgBus, allowEmptyStartup, debug)
 			if err != nil {
 				logger.Errorf("Manual reload failed: %v", err)
 			} else {
@@ -212,6 +266,13 @@ func Run(debug bool, homePath, configPath string, allowEmptyStartup bool) error 
 			}
 		}
 	}
+}
+
+func preCheckConfig(cfg *config.Config) error {
+	if cfg.Gateway.Port <= 0 || cfg.Gateway.Port > 65535 {
+		return fmt.Errorf("invalid gateway port: %d, port must be between 1 and 65535", cfg.Gateway.Port)
+	}
+	return nil
 }
 
 func executeReload(
@@ -222,9 +283,13 @@ func executeReload(
 	runningServices *services,
 	msgBus *bus.MessageBus,
 	allowEmptyStartup bool,
+	debug bool,
 ) error {
 	defer runningServices.reloading.Store(false)
-	return handleConfigReload(ctx, agentLoop, newCfg, provider, runningServices, msgBus, allowEmptyStartup)
+
+	overridePicoToken(newCfg, runningServices.authToken)
+
+	return handleConfigReload(ctx, agentLoop, newCfg, provider, runningServices, msgBus, allowEmptyStartup, debug)
 }
 
 func createStartupProvider(
@@ -248,6 +313,7 @@ func setupAndStartServices(
 	cfg *config.Config,
 	agentLoop *agent.AgentLoop,
 	msgBus *bus.MessageBus,
+	authToken string,
 ) (*services, error) {
 	runningServices := &services{}
 
@@ -290,6 +356,8 @@ func setupAndStartServices(
 		fms.Start()
 	}
 
+	overridePicoToken(cfg, authToken)
+
 	runningServices.ChannelManager, err = channels.NewManager(cfg, msgBus, runningServices.MediaStore)
 	if err != nil {
 		if fms, ok := runningServices.MediaStore.(*media.FileMediaStore); ok {
@@ -298,13 +366,37 @@ func setupAndStartServices(
 		return nil, fmt.Errorf("error creating channel manager: %w", err)
 	}
 
+	// Initialize WhatsApp pool if enabled (before StartAll so slots are registered)
+	if cfg.Channels.WhatsApp.Enabled && cfg.Channels.WhatsApp.UseNative && cfg.Channels.WhatsApp.Pool.Enabled {
+		basePath := filepath.Join(cfg.WorkspacePath(), "whatsapp")
+		pool := whatsappnative.NewWhatsAppPool(
+			cfg.Channels.WhatsApp,
+			msgBus,
+			basePath,
+			cfg.Channels.WhatsApp.Pool.MaxSlots,
+		)
+		poolChannels, poolErr := pool.Start(context.Background())
+		if poolErr != nil {
+			logger.ErrorCF("gateway", "WhatsApp pool start failed", map[string]any{"error": poolErr.Error()})
+		} else {
+			for name, ch := range poolChannels {
+				runningServices.ChannelManager.RegisterChannel(name, ch)
+			}
+			runningServices.WAPool = pool
+			fmt.Printf("✓ WhatsApp pool enabled with %d slot(s)\n", len(poolChannels))
+		}
+	}
+
 	agentLoop.SetChannelManager(runningServices.ChannelManager)
 	agentLoop.SetMediaStore(runningServices.MediaStore)
 
-	if transcriber := voice.DetectTranscriber(cfg); transcriber != nil {
+	transcriber := asr.DetectTranscriber(cfg)
+	if transcriber != nil {
 		agentLoop.SetTranscriber(transcriber)
 		logger.InfoCF("voice", "Transcription enabled (agent-level)", map[string]any{"provider": transcriber.Name()})
 	}
+
+	ttsAvailable := tts.DetectTTS(cfg) != nil
 
 	enabledChannels := runningServices.ChannelManager.GetEnabledChannels()
 	if len(enabledChannels) > 0 {
@@ -314,11 +406,708 @@ func setupAndStartServices(
 	}
 
 	addr := fmt.Sprintf("%s:%d", cfg.Gateway.Host, cfg.Gateway.Port)
-	runningServices.HealthServer = health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
+	runningServices.authToken = authToken
+	runningServices.HealthServer = health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port, authToken)
 	runningServices.ChannelManager.SetupHTTPServer(addr, runningServices.HealthServer)
+
+	// API: send text to WhatsApp Status broadcast
+	runningServices.ChannelManager.HandleFunc("/api/send-status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Text == "" {
+			http.Error(w, "bad request: text required", http.StatusBadRequest)
+			return
+		}
+		// Try single-instance first, then pool slots
+		type statusSender interface {
+			SendStatus(ctx context.Context, text string) error
+		}
+		var sender statusSender
+		if ch, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if s, ok := ch.(statusSender); ok {
+				sender = s
+			}
+		}
+		if sender == nil && runningServices.WAPool != nil {
+			for _, slot := range runningServices.WAPool.ConnectedSlots() {
+				sender = slot.Channel
+				break
+			}
+		}
+		if sender == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		if err := sender.SendStatus(r.Context(), body.Text); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send direct message to a WhatsApp contact
+	runningServices.ChannelManager.HandleFunc("/api/send-message", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To   string `json:"to"`
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Text == "" {
+			http.Error(w, "bad request: to and text required", http.StatusBadRequest)
+			return
+		}
+		type directSender interface {
+			Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error)
+		}
+		var sender directSender
+		if ch, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if s, ok := ch.(directSender); ok {
+				sender = s
+			}
+		}
+		if sender == nil && runningServices.WAPool != nil {
+			for _, slot := range runningServices.WAPool.ConnectedSlots() {
+				sender = slot.Channel
+				break
+			}
+		}
+		if sender == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		msg := bus.OutboundMessage{
+			ChatID:  body.To,
+			Content: body.Text,
+		}
+		if _, err := sender.Send(r.Context(), msg); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: list joined WhatsApp groups
+	runningServices.ChannelManager.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		groups, err := ch.GetJoinedGroups(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(groups)
+	})
+
+	// API: send a sticker (WebP) to a WhatsApp chat
+	// Accepts either JSON with base64 data or multipart form with file
+	runningServices.ChannelManager.HandleFunc("/api/send-sticker", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var to string
+		var webpData []byte
+
+		contentType := r.Header.Get("Content-Type")
+		if strings.HasPrefix(contentType, "multipart/") {
+			// Multipart form: file upload
+			if err := r.ParseMultipartForm(2 << 20); err != nil { // 2MB max
+				http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			to = r.FormValue("to")
+			file, _, err := r.FormFile("sticker")
+			if err != nil {
+				http.Error(w, "bad request: sticker file required", http.StatusBadRequest)
+				return
+			}
+			defer file.Close()
+			webpData, err = io.ReadAll(file)
+			if err != nil {
+				http.Error(w, "failed to read file", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// JSON with base64
+			var body struct {
+				To   string `json:"to"`
+				Data string `json:"data"` // base64 encoded WebP
+				File string `json:"file"` // or local file path
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			to = body.To
+			if body.Data != "" {
+				var err error
+				webpData, err = base64.StdEncoding.DecodeString(body.Data)
+				if err != nil {
+					http.Error(w, "bad request: invalid base64", http.StatusBadRequest)
+					return
+				}
+			} else if body.File != "" {
+				var err error
+				webpData, err = os.ReadFile(body.File)
+				if err != nil {
+					http.Error(w, "bad request: cannot read file: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		if to == "" || len(webpData) == 0 {
+			http.Error(w, "bad request: to and sticker data required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendSticker(r.Context(), to, webpData); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: block/unblock a contact
+	runningServices.ChannelManager.HandleFunc("/api/block", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To     string `json:"to"`
+			Action string `json:"action"` // "block" or "unblock"
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" {
+			http.Error(w, "bad request: to required", http.StatusBadRequest)
+			return
+		}
+		if body.Action == "" {
+			body.Action = "block"
+		}
+		var err error
+		if body.Action == "unblock" {
+			err = ch.UnblockContact(r.Context(), body.To)
+		} else {
+			err = ch.BlockContact(r.Context(), body.To)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "action": body.Action})
+	})
+
+	// API: get blocklist
+	runningServices.ChannelManager.HandleFunc("/api/blocklist", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		list, err := ch.GetBlocklist(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(list)
+	})
+
+	// API: set the bot's "about" bio message
+	runningServices.ChannelManager.HandleFunc("/api/set-bio", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Text == "" {
+			http.Error(w, "bad request: text required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SetBio(r.Context(), body.Text); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: get subgroups of a community
+	runningServices.ChannelManager.HandleFunc("/api/community/subgroups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		communityJID := r.URL.Query().Get("jid")
+		if communityJID == "" {
+			http.Error(w, "bad request: jid query param required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		subs, err := ch.GetSubGroups(r.Context(), communityJID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(subs)
+	})
+
+	// API: send an interactive message with native flow buttons
+	runningServices.ChannelManager.HandleFunc("/api/send-interactive", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To      string              `json:"to"`
+			Title   string              `json:"title"`
+			Text    string              `json:"text"`
+			Footer  string              `json:"footer"`
+			Buttons []map[string]string `json:"buttons"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Text == "" || len(body.Buttons) == 0 {
+			http.Error(w, "bad request: to, text, and buttons required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendInteractive(r.Context(), body.To, body.Title, body.Text, body.Footer, body.Buttons); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a message with buttons
+	runningServices.ChannelManager.HandleFunc("/api/send-buttons", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To      string              `json:"to"`
+			Text    string              `json:"text"`
+			Footer  string              `json:"footer"`
+			Buttons []map[string]string `json:"buttons"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Text == "" || len(body.Buttons) == 0 {
+			http.Error(w, "bad request: to, text, and buttons required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendButtons(r.Context(), body.To, body.Text, body.Footer, body.Buttons); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: set disappearing messages timer for a chat
+	runningServices.ChannelManager.HandleFunc("/api/set-disappearing", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			Chat  string `json:"chat"`
+			Timer string `json:"timer"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Chat == "" || body.Timer == "" {
+			http.Error(w, "bad request: chat and timer required (off, 24h, 7d, 90d)", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SetDisappearingTimer(r.Context(), body.Chat, body.Timer); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "timer": body.Timer})
+	})
+
+	// API: send an image to a WhatsApp chat
+	runningServices.ChannelManager.HandleFunc("/api/send-image", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To       string `json:"to"`
+			File     string `json:"file"`
+			Caption  string `json:"caption"`
+			ViewOnce bool   `json:"view_once"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.File == "" {
+			http.Error(w, "bad request: to and file required", http.StatusBadRequest)
+			return
+		}
+		imageData, err := os.ReadFile(body.File)
+		if err != nil {
+			http.Error(w, "cannot read file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		mimetype := "image/jpeg"
+		if strings.HasSuffix(strings.ToLower(body.File), ".png") {
+			mimetype = "image/png"
+		} else if strings.HasSuffix(strings.ToLower(body.File), ".webp") {
+			mimetype = "image/webp"
+		}
+		if err := ch.SendImage(r.Context(), body.To, imageData, mimetype, body.Caption, body.ViewOnce); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a video to a WhatsApp chat
+	runningServices.ChannelManager.HandleFunc("/api/send-video", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To       string `json:"to"`
+			File     string `json:"file"`
+			Caption  string `json:"caption"`
+			ViewOnce bool   `json:"view_once"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.File == "" {
+			http.Error(w, "bad request: to and file required", http.StatusBadRequest)
+			return
+		}
+		videoData, err := os.ReadFile(body.File)
+		if err != nil {
+			http.Error(w, "cannot read file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendVideo(r.Context(), body.To, videoData, body.Caption, body.ViewOnce); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a vCard contact to a WhatsApp chat
+	runningServices.ChannelManager.HandleFunc("/api/send-contact", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To    string `json:"to"`
+			Name  string `json:"name"`
+			Phone string `json:"phone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Name == "" || body.Phone == "" {
+			http.Error(w, "bad request: to, name, and phone required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		if err := ch.SendContact(r.Context(), body.To, body.Name, body.Phone); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a poll to a WhatsApp contact or group
+	runningServices.ChannelManager.HandleFunc("/api/send-poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To              string   `json:"to"`
+			Question        string   `json:"question"`
+			Options         []string `json:"options"`
+			SelectableCount int      `json:"selectable_count"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Question == "" || len(body.Options) < 2 {
+			http.Error(w, "bad request: to, question, and at least 2 options required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		if err := ch.SendPoll(r.Context(), body.To, body.Question, body.Options, body.SelectableCount); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: subscribe to presence updates for a contact
+	runningServices.ChannelManager.HandleFunc("/api/presence/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To string `json:"to"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" {
+			http.Error(w, "bad request: to required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		if err := ch.SubscribePresence(r.Context(), body.To); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "subscribed", "to": body.To})
+	})
+
+	// API: get presence status for a contact (must subscribe first)
+	runningServices.ChannelManager.HandleFunc("/api/presence/check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		to := r.URL.Query().Get("to")
+		if to == "" {
+			http.Error(w, "bad request: to query param required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		info := ch.GetPresence(to)
+		w.Header().Set("Content-Type", "application/json")
+		if info == nil {
+			json.NewEncoder(w).Encode(map[string]string{"status": "unknown", "to": to})
+		} else {
+			json.NewEncoder(w).Encode(info)
+		}
+	})
+
+	// API: WhatsApp pool status
+	runningServices.ChannelManager.HandleFunc("/api/whatsapp/pool/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if runningServices.WAPool == nil {
+			http.Error(w, "whatsapp pool not enabled", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"slots": runningServices.WAPool.GetSlotStatuses(),
+		})
+	})
+
+	// API: WhatsApp pool QR events (Server-Sent Events)
+	runningServices.ChannelManager.HandleFunc("/api/whatsapp/pool/qr", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if runningServices.WAPool == nil {
+			http.Error(w, "whatsapp pool not enabled", http.StatusServiceUnavailable)
+			return
+		}
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		flusher.Flush()
+
+		ctx := r.Context()
+		qrCh := runningServices.WAPool.QREvents()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case evt, ok := <-qrCh:
+				if !ok {
+					return
+				}
+				data, _ := json.Marshal(evt)
+				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.Event, data)
+				flusher.Flush()
+			}
+		}
+	})
 
 	if err = runningServices.ChannelManager.StartAll(context.Background()); err != nil {
 		return nil, fmt.Errorf("error starting channels: %w", err)
+	}
+
+	logChannelVoiceCapabilities(runningServices.ChannelManager, transcriber != nil, ttsAvailable)
+
+	if transcriber != nil {
+		// Start Voice Agent Orchestrator after channels are ready.
+		vaCtx, vaCancel := context.WithCancel(context.Background())
+		runningServices.VoiceAgentCancel = vaCancel
+		voiceAgent := asr.NewAgent(msgBus, transcriber)
+		voiceAgent.Start(vaCtx)
 	}
 
 	fmt.Printf(
@@ -347,8 +1136,14 @@ func stopAndCleanupServices(runningServices *services, shutdownTimeout time.Dura
 	defer shutdownCancel()
 
 	// reload should not stop channel manager
+	if !isReload && runningServices.WAPool != nil {
+		runningServices.WAPool.Stop(shutdownCtx)
+	}
 	if !isReload && runningServices.ChannelManager != nil {
 		runningServices.ChannelManager.StopAll(shutdownCtx)
+	}
+	if runningServices.VoiceAgentCancel != nil {
+		runningServices.VoiceAgentCancel()
 	}
 	if runningServices.DeviceService != nil {
 		runningServices.DeviceService.Stop()
@@ -392,6 +1187,7 @@ func handleConfigReload(
 	runningServices *services,
 	msgBus *bus.MessageBus,
 	allowEmptyStartup bool,
+	debug bool,
 ) error {
 	logger.Info("🔄 Config file changed, reloading...")
 
@@ -440,6 +1236,15 @@ func handleConfigReload(
 	}
 
 	logger.Info("  ✓ Provider, configuration, and services reloaded successfully (thread-safe)")
+
+	// Debug mode permanently overrides the config log level to DEBUG.
+	if !debug {
+		// Update log level last so that reload-related info/warn logs above are not suppressed.
+		effectiveLogLevel := config.EffectiveGatewayLogLevel(newCfg)
+		logger.SetLevelFromString(effectiveLogLevel)
+		logger.Infof("Log level changing from current to %q", effectiveLogLevel)
+	}
+
 	return nil
 }
 
@@ -490,11 +1295,12 @@ func restartServices(
 	}
 	al.SetMediaStore(runningServices.MediaStore)
 
-	runningServices.ChannelManager, err = channels.NewManager(cfg, msgBus, runningServices.MediaStore)
-	if err != nil {
-		return fmt.Errorf("error recreating channel manager: %w", err)
-	}
 	al.SetChannelManager(runningServices.ChannelManager)
+
+	if err = runningServices.ChannelManager.Reload(context.Background(), cfg); err != nil {
+		return fmt.Errorf("error reload channels: %w", err)
+	}
+	fmt.Println("  ✓ Channels restarted.")
 
 	enabledChannels := runningServices.ChannelManager.GetEnabledChannels()
 	if len(enabledChannels) > 0 {
@@ -502,18 +1308,6 @@ func restartServices(
 	} else {
 		fmt.Println("  ⚠ Warning: No channels enabled")
 	}
-
-	addr := fmt.Sprintf("%s:%d", cfg.Gateway.Host, cfg.Gateway.Port)
-	// Reuse existing HealthServer to preserve reloadFunc
-	if runningServices.HealthServer == nil {
-		runningServices.HealthServer = health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
-	}
-	runningServices.ChannelManager.SetupHTTPServer(addr, runningServices.HealthServer)
-
-	if err = runningServices.ChannelManager.Reload(context.Background(), cfg); err != nil {
-		return fmt.Errorf("error reload channels: %w", err)
-	}
-	fmt.Println("  ✓ Channels restarted.")
 
 	stateManager := state.NewManager(cfg.WorkspacePath())
 	runningServices.DeviceService = devices.NewService(devices.Config{
@@ -527,13 +1321,24 @@ func restartServices(
 		fmt.Println("  ✓ Device event service restarted")
 	}
 
-	transcriber := voice.DetectTranscriber(cfg)
+	transcriber := asr.DetectTranscriber(cfg)
 	al.SetTranscriber(transcriber)
 	if transcriber != nil {
 		logger.InfoCF("voice", "Transcription re-enabled (agent-level)", map[string]any{"provider": transcriber.Name()})
+
+		// Start Voice Agent Orchestrator on reload
+		vaCtx, vaCancel := context.WithCancel(context.Background())
+		runningServices.VoiceAgentCancel = vaCancel
+		voiceAgent := asr.NewAgent(msgBus, transcriber)
+		voiceAgent.Start(vaCtx)
 	} else {
 		logger.InfoCF("voice", "Transcription disabled", nil)
 	}
+
+	ttsAvailable := tts.DetectTTS(cfg) != nil
+	logChannelVoiceCapabilities(runningServices.ChannelManager, transcriber != nil, ttsAvailable)
+	// NOTE: PID file is written once at startup and not updated on reload.
+	// Changing the gateway listen address requires a full restart.
 
 	return nil
 }
@@ -651,6 +1456,20 @@ func setupCronTool(
 	}
 
 	return cronService, nil
+}
+
+// overridePicoToken replaces the pico channel token with the one from the PID file.
+// The PID file is the single source of truth for the pico auth token;
+// it is generated once at gateway startup and remains unchanged across reloads.
+func overridePicoToken(cfg *config.Config, token string) {
+	if !cfg.Channels.Pico.Enabled {
+		return
+	}
+	picoToken := cfg.Channels.Pico.Token.String()
+	if picoToken == "" || strings.HasPrefix(picoToken, pico.PicoTokenPrefix) {
+		return
+	}
+	cfg.Channels.Pico.SetToken(pico.PicoTokenPrefix + token + picoToken)
 }
 
 func createHeartbeatHandler(agentLoop *agent.AgentLoop) func(prompt, channel, chatID string) *tools.ToolResult {

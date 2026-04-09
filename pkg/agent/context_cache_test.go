@@ -707,6 +707,88 @@ func TestEmptyWorkspaceBaselineDetectsNewFiles(t *testing.T) {
 	}
 }
 
+func TestBuildMessages_IncludesMediaOnlyCurrentMessage(t *testing.T) {
+	tmpDir := setupWorkspace(t, nil)
+	defer os.RemoveAll(tmpDir)
+
+	cb := NewContextBuilder(tmpDir)
+	msgs := cb.BuildMessages(
+		nil,
+		"",
+		"",
+		[]string{"data:image/png;base64,abc123"},
+		"pico",
+		"chat-1",
+		"",
+		"",
+	)
+
+	if len(msgs) != 2 {
+		t.Fatalf("len(msgs) = %d, want 2", len(msgs))
+	}
+
+	userMsg := msgs[1]
+	if userMsg.Role != "user" {
+		t.Fatalf("userMsg.Role = %q, want %q", userMsg.Role, "user")
+	}
+	if userMsg.Content != "" {
+		t.Fatalf("userMsg.Content = %q, want empty string", userMsg.Content)
+	}
+	if len(userMsg.Media) != 1 || userMsg.Media[0] != "data:image/png;base64,abc123" {
+		t.Fatalf("userMsg.Media = %#v, want image payload", userMsg.Media)
+	}
+}
+
+// TestSkillManageGuidanceInjection verifies that the Skills guidance rule
+// appears in the system prompt when skillManageEnabled is true and is absent
+// when false. This is the key "trigger" for the self-improvement loop.
+func TestSkillManageGuidanceInjection(t *testing.T) {
+	tmpDir := setupWorkspace(t, nil)
+	defer os.RemoveAll(tmpDir)
+
+	t.Run("enabled", func(t *testing.T) {
+		cb := NewContextBuilder(tmpDir).WithSkillManage(true)
+		prompt := cb.BuildSystemPrompt()
+		if !strings.Contains(prompt, "skill_manage") {
+			t.Error("prompt should mention skill_manage when enabled")
+		}
+		if !strings.Contains(prompt, "5+ tool calls") {
+			t.Error("prompt should contain the '5+ tool calls' trigger guidance")
+		}
+		if !strings.Contains(prompt, "Skills that are not maintained become liabilities") {
+			t.Error("prompt should contain the maintenance warning")
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		cb := NewContextBuilder(tmpDir).WithSkillManage(false)
+		prompt := cb.BuildSystemPrompt()
+		if strings.Contains(prompt, "skill_manage") {
+			t.Error("prompt should NOT mention skill_manage when disabled")
+		}
+	})
+
+	t.Run("memory-guidance-enriched", func(t *testing.T) {
+		cb := NewContextBuilder(tmpDir)
+		prompt := cb.BuildSystemPrompt()
+		if !strings.Contains(prompt, "Save durable facts") {
+			t.Error("memory rule should contain enriched guidance")
+		}
+		if !strings.Contains(prompt, "reusable procedure") {
+			t.Error("memory rule should guide users to save procedures as skills")
+		}
+	})
+
+	t.Run("dynamic-numbering", func(t *testing.T) {
+		cb := NewContextBuilder(tmpDir).WithSkillManage(true)
+		prompt := cb.BuildSystemPrompt()
+		// Skills should be rule #5 (after rules 1-4)
+		if !strings.Contains(prompt, "5. **Skills**") {
+			t.Error("skills should be rule 5 when skill_manage is enabled")
+		}
+	})
+}
+
 // BenchmarkBuildMessagesWithCache measures caching performance.
 func BenchmarkBuildMessagesWithCache(b *testing.B) {
 	tmpDir, _ := os.MkdirTemp("", "picoclaw-bench-*")

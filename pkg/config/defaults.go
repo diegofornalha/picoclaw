@@ -6,7 +6,6 @@
 package config
 
 import (
-	"os"
 	"path/filepath"
 
 	"github.com/sipeed/picoclaw/pkg"
@@ -14,19 +13,15 @@ import (
 
 // DefaultConfig returns the default configuration for PicoClaw.
 func DefaultConfig() *Config {
-	// Determine the base path for the workspace.
-	// Priority: $PICOCLAW_HOME > ~/.picoclaw
-	var homePath string
-	if picoclawHome := os.Getenv(EnvHome); picoclawHome != "" {
-		homePath = picoclawHome
-	} else {
-		userHome, _ := os.UserHomeDir()
-		homePath = filepath.Join(userHome, pkg.DefaultPicoClawHome)
-	}
-	workspacePath := filepath.Join(homePath, pkg.WorkspaceName)
+	workspacePath := filepath.Join(GetHome(), pkg.WorkspaceName)
 
 	return &Config{
 		Version: CurrentVersion,
+		// Isolation is opt-in so existing installations keep their current behavior
+		// until the user explicitly enables subprocess sandboxing.
+		Isolation: IsolationConfig{
+			Enabled: false,
+		},
 		Agents: AgentsConfig{
 			Defaults: AgentDefaults{
 				Workspace:                 workspacePath,
@@ -56,6 +51,7 @@ func DefaultConfig() *Config {
 				UseNative:        false,
 				SessionStorePath: "",
 				AllowFrom:        FlexibleStringSlice{},
+				Pool:             WhatsAppPoolConfig{Enabled: false, MaxSlots: 10},
 			},
 			Telegram: TelegramConfig{
 				Enabled:   false,
@@ -193,6 +189,13 @@ func DefaultConfig() *Config {
 				ModelName: "deepseek-chat",
 				Model:     "deepseek/deepseek-chat",
 				APIBase:   "https://api.deepseek.com/v1",
+			},
+
+			// Venice AI - https://venice.ai
+			{
+				ModelName: "venice-uncensored",
+				Model:     "venice/venice-uncensored",
+				APIBase:   "https://api.venice.ai/api/v1",
 			},
 
 			// Google Gemini - https://ai.google.dev/
@@ -345,6 +348,13 @@ func DefaultConfig() *Config {
 				APIBase:   "http://localhost:8000/v1",
 			},
 
+			// LM Studio (local) - http://localhost:1234
+			{
+				ModelName: "lmstudio-local",
+				Model:     "lmstudio/openai/gpt-oss-20b",
+				APIBase:   "http://localhost:1234/v1",
+			},
+
 			// Azure OpenAI - https://portal.azure.com
 			// model_name is a user-friendly alias; the model field's path after "azure/" is your deployment name
 			{
@@ -357,7 +367,7 @@ func DefaultConfig() *Config {
 			Host:      "127.0.0.1",
 			Port:      18790,
 			HotReload: false,
-			LogLevel:  "fatal",
+			LogLevel:  DefaultGatewayLogLevel,
 		},
 		Tools: ToolsConfig{
 			FilterSensitiveData: true,
@@ -444,6 +454,9 @@ func DefaultConfig() *Config {
 			SendFile: ToolConfig{
 				Enabled: true,
 			},
+			SendTTS: ToolConfig{
+				Enabled: false,
+			},
 			MCP: MCPConfig{
 				ToolConfig: ToolConfig{
 					Enabled: false,
@@ -455,7 +468,8 @@ func DefaultConfig() *Config {
 					UseBM25:          true,
 					UseRegex:         false,
 				},
-				Servers: map[string]MCPServerConfig{},
+				MaxInlineTextChars: DefaultMCPMaxInlineTextChars,
+				Servers:            map[string]MCPServerConfig{},
 			},
 			AppendFile: ToolConfig{
 				Enabled: true,
@@ -480,6 +494,7 @@ func DefaultConfig() *Config {
 			},
 			ReadFile: ReadFileToolConfig{
 				Enabled:         true,
+				Mode:            ReadFileModeBytes,
 				MaxReadFileSize: 64 * 1024, // 64KB
 			},
 			Spawn: ToolConfig{
@@ -518,12 +533,6 @@ func DefaultConfig() *Config {
 			GitCommit: GitCommit,
 			BuildTime: BuildTime,
 			GoVersion: GoVersion,
-		},
-		security: &SecurityConfig{
-			ModelList: map[string]ModelSecurityEntry{},
-			Channels:  &ChannelsSecurity{},
-			Web:       &WebToolsSecurity{},
-			Skills:    &SkillsSecurity{},
 		},
 	}
 }

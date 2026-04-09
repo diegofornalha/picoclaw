@@ -1,3 +1,4 @@
+import { launcherFetch } from "@/api/http"
 import { refreshGatewayState } from "@/store/gateway"
 
 // API client for model list management.
@@ -18,8 +19,10 @@ export interface ModelInfo {
   request_timeout?: number
   thinking_level?: string
   extra_body?: Record<string, unknown>
+  custom_headers?: Record<string, string>
   // Meta
-  configured: boolean
+  available: boolean
+  status: "available" | "unconfigured" | "unreachable"
   is_default: boolean
   is_virtual: boolean
 }
@@ -39,7 +42,7 @@ interface ModelActionResponse {
 const BASE_URL = ""
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, options)
+  const res = await launcherFetch(`${BASE_URL}${path}`, options)
   if (!res.ok) {
     throw new Error(`API error: ${res.status} ${res.statusText}`)
   }

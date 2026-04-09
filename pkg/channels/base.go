@@ -48,7 +48,7 @@ type Channel interface {
 	Name() string
 	Start(ctx context.Context) error
 	Stop(ctx context.Context) error
-	Send(ctx context.Context, msg bus.OutboundMessage) error
+	Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error)
 	IsRunning() bool
 	IsAllowed(senderID string) bool
 	IsAllowedSender(sender bus.SenderInfo) bool
@@ -112,6 +112,18 @@ func NewBaseChannel(
 	for _, opt := range opts {
 		opt(bc)
 	}
+
+	// Security Audit: Check for open-by-default (unsecured) channels.
+	// PicoClaw aims to be secure-by-default. If allow_from is empty, the bot
+	// currently defaults to accepting messages from ANYONE. To explicitly
+	// acknowledge and permit this (e.g. for a public bot), use ["*"].
+	if len(bc.allowList) == 0 {
+		logger.WarnCF("channels", "SECURITY: Channel allows EVERYONE (allow_from is empty)", map[string]any{
+			"channel": bc.name,
+			"hint":    "Set allow_from to your ID, or use '*' to explicitly acknowledge open access.",
+		})
+	}
+
 	return bc
 }
 
@@ -187,6 +199,9 @@ func (c *BaseChannel) IsAllowed(senderID string) bool {
 	}
 
 	for _, allowed := range c.allowList {
+		if allowed == "*" {
+			return true
+		}
 		// Strip leading "@" from allowed value for username matching
 		trimmed := strings.TrimPrefix(allowed, "@")
 		allowedID := trimmed
@@ -221,7 +236,7 @@ func (c *BaseChannel) IsAllowedSender(sender bus.SenderInfo) bool {
 	}
 
 	for _, allowed := range c.allowList {
-		if identity.MatchAllowed(sender, allowed) {
+		if allowed == "*" || identity.MatchAllowed(sender, allowed) {
 			return true
 		}
 	}
@@ -279,7 +294,9 @@ func (c *BaseChannel) HandleMessage(
 	// If streaming actually activates, preSend will skip the placeholder edit (streamActive map)
 	// and the typing stop will still be called. This avoids the problem of compile-time interface
 	// checks incorrectly skipping indicators when streaming may not work at runtime.
-	if c.owner != nil && c.placeholderRecorder != nil {
+	// Skip all indicators for group chats (chatID contains @g.us).
+	isGroup := strings.Contains(chatID, "@g.us")
+	if c.owner != nil && c.placeholderRecorder != nil && !isGroup {
 		// Typing
 		if tc, ok := c.owner.(TypingCapable); ok {
 			if stop, err := tc.StartTyping(ctx, chatID); err == nil {
@@ -293,10 +310,13 @@ func (c *BaseChannel) HandleMessage(
 			}
 		}
 		// Placeholder — independent pipeline.
+		// Skip for slash commands (e.g. /clear, /link-magico) — they are fast operations
+		// that don't need a placeholder, and /clear would leave it orphaned.
 		// Skip when the message contains audio: the agent will send the
 		// placeholder after transcription completes, so the user sees
 		// "Thinking…" only once the voice has been processed.
-		if !audioAnnotationRe.MatchString(content) {
+		isCommand := strings.HasPrefix(strings.TrimSpace(content), "/")
+		if !isCommand && !audioAnnotationRe.MatchString(content) {
 			if pc, ok := c.owner.(PlaceholderCapable); ok {
 				if phID, err := pc.SendPlaceholder(ctx, chatID); err == nil && phID != "" {
 					c.placeholderRecorder.RecordPlaceholder(c.name, chatID, phID)

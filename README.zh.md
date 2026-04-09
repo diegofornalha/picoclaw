@@ -18,7 +18,7 @@
     <a href="https://discord.gg/V4sAZ9XWpN"><img src="https://img.shields.io/badge/Discord-Community-4c60eb?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
   </p>
 
-**中文** | [日本語](README.ja.md) | [Português](README.pt-br.md) | [Tiếng Việt](README.vi.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Bahasa Indonesia](README.id.md) | [English](README.md)
+**中文** | [日本語](README.ja.md) | [한국어](README.ko.md) | [Português](README.pt-br.md) | [Tiếng Việt](README.vi.md) | [Français](README.fr.md) | [Italiano](README.it.md) | [Bahasa Indonesia](README.id.md) | [Malay](README.my.md) | [English](README.md)
 
 </div>
 
@@ -56,16 +56,20 @@
 
 ## 📢 新闻
 
+2026-03-31 📱 **Android 支持！** PicoClaw 现可在 Android 上运行！APK 下载地址：[picoclaw.io](https://picoclaw.io/download)
+
+2026-03-25 🚀 **v0.2.4 发布！** Agent 架构全面重构（SubTurn、Hook、Steering、EventBus）、微信/企业微信深度集成、安全体系升级（.security.yml、敏感数据过滤）、新增 Provider（AWS Bedrock、Azure、小米 MiMo），以及 35 项 Bug 修复。PicoClaw 已达 **26K ⭐**！
+
 2026-03-17 🚀 **v0.2.3 发布！** 系统托盘 UI（Windows & Linux）、子 Agent 状态查询 (`spawn_status`)、实验性 Gateway 热重载、Cron 安全门控，以及 2 项安全修复。PicoClaw 已达 **25K ⭐**！
 
 2026-03-09 🎉 **v0.2.1 — 史上最大更新！** MCP 协议支持、4 个新频道 (Matrix/IRC/WeCom/Discord Proxy)、3 个新 Provider (Kimi/Minimax/Avian)、视觉管线、JSONL 记忆存储、模型路由。
 
 2026-02-28 📦 **v0.2.0** 发布，支持 Docker Compose 和 Web UI 启动器。
 
-2026-02-26 🎉 PicoClaw 仅 17 天突破 **20K Stars**！频道自动编排和能力接口上线。
-
 <details>
 <summary>更早的新闻...</summary>
+
+2026-02-26 🎉 PicoClaw 仅 17 天突破 **20K Stars**！频道自动编排和能力接口上线。
 
 2026-02-16 🎉 PicoClaw 一周内突破 12K Stars！社区维护者角色和 [路线图](ROADMAP.md) 正式发布。
 
@@ -254,6 +258,29 @@ docker compose -f docker/docker-compose.yml --profile launcher up -d
 
 </details>
 
+<details>
+<summary><b>macOS — 首次启动安全警告</b></summary>
+
+macOS 可能会在首次启动时拦截 `picoclaw-launcher`，因为它从互联网下载，未经 Mac App Store 公证。
+
+**第一步：** 双击 `picoclaw-launcher`，会出现安全警告：
+
+<p align="center">
+<img src="assets/macos-gatekeeper-warning.jpg" alt="macOS Gatekeeper 警告" width="400">
+</p>
+
+> *"picoclaw-launcher" 无法打开 — Apple 无法验证 "picoclaw-launcher" 不含可能损害 Mac 或危及隐私的恶意软件。*
+
+**第二步：** 打开**系统设置** → **隐私与安全性** → 向下滚动找到**安全性**部分 → 点击**仍要打开** → 在弹窗中再次点击**打开**。
+
+<p align="center">
+<img src="assets/macos-gatekeeper-allow.jpg" alt="macOS 隐私与安全性 — 仍要打开" width="600">
+</p>
+
+完成这一次操作后，后续启动 `picoclaw-launcher` 将不再弹出警告。
+
+</details>
+
 ### 💻 TUI Launcher（推荐无头环境 / SSH）
 
 TUI（终端 UI）Launcher 提供功能完整的终端配置与管理界面，适合服务器、树莓派等无显示器环境。
@@ -276,7 +303,25 @@ picoclaw-launcher-tui
 
 让你十年前的旧手机焕发新生！将它变成你的 AI 助手。
 
-**方式一：Termux（现已可用）**
+**方式一：APK 安装**
+
+预览：
+
+<table>
+  <tr>
+    <td><img src="assets/fui_main_page.jpg" width="200"></td>
+    <td><img src="assets/fui_web_page.jpg" width="200"></td>
+    <td><img src="assets/fui_log_page.jpg" width="200"></td>
+    <td><img src="assets/fui_setting_page.jpg" width="200"></td>
+  </tr>
+</table>
+
+从 [picoclaw.io](https://picoclaw.io/download/) 下载 APK 并直接安装，无需 Termux！
+
+**方式二：Termux**
+
+<details>
+<summary><b>Terminal Launcher（适用于资源受限环境）</b></summary>
 
 1. 安装 [Termux](https://github.com/termux/termux-app)（可从 [GitHub Releases](https://github.com/termux/termux-app/releases) 下载，或在 F-Droid / Google Play 中搜索）
 2. 执行以下命令：
@@ -292,13 +337,6 @@ termux-chroot ./picoclaw onboard   # chroot 提供标准 Linux 文件系统布�
 然后跟随下面的"Terminal Launcher"章节继续配置。
 
 <img src="assets/termux.jpg" alt="PicoClaw on Termux" width="512">
-
-**方式二：APK 安装（即将推出）**
-
-内置 WebUI 的独立 Android APK 正在开发中，敬请期待！
-
-<details>
-<summary><b>Terminal Launcher（适用于资源受限环境）</b></summary>
 
 对于只有 `picoclaw` 核心二进制文件的极简环境（无 Launcher UI），可通过命令行和 JSON 配置文件完成所有配置。
 
@@ -367,6 +405,7 @@ PicoClaw 通过 `model_list` 配置支持 30+ LLM Provider，使用 `协议/模�
 | [NVIDIA NIM](https://build.nvidia.com/) | `nvidia/` | 必填 | NVIDIA 托管模型 |
 | [Cerebras](https://cloud.cerebras.ai/) | `cerebras/` | 必填 | 快速推理 |
 | [Novita AI](https://novita.ai/) | `novita/` | 必填 | 多种开源模型 |
+| [小米 MiMo](https://platform.xiaomimimo.com/) | `mimo/` | 必填 | MiMo 系列模型 |
 | [Ollama](https://ollama.com/) | `ollama/` | 无需 | 本地模型，自托管 |
 | [vLLM](https://docs.vllm.ai/) | `vllm/` | 无需 | 本地部署，兼容 OpenAI |
 | [LiteLLM](https://docs.litellm.ai/) | `litellm/` | 视情况 | 100+ Provider 代理 |
@@ -409,7 +448,7 @@ PicoClaw 通过 `model_list` 配置支持 30+ LLM Provider，使用 `协议/模�
 
 ## 💬 Channels（聊天应用）
 
-通过 17+ 消息平台与你的 PicoClaw 对话：
+通过 18+ 消息平台与你的 PicoClaw 对话：
 
 | Channel | 配置难度 | 协议 | 文档 |
 |---------|----------|------|------|
@@ -423,9 +462,8 @@ PicoClaw 通过 `model_list` 配置支持 30+ LLM Provider，使用 `协议/模�
 | **钉钉** | 中等（client credentials） | Stream | [指南](docs/channels/dingtalk/README.zh.md) |
 | **飞书 / Lark** | 中等（App ID + Secret） | WebSocket/SDK | [指南](docs/channels/feishu/README.zh.md) |
 | **LINE** | 中等（credentials + webhook） | Webhook | [指南](docs/channels/line/README.zh.md) |
-| **企业微信机器人** | 中等（webhook URL） | Webhook | [指南](docs/channels/wecom/wecom_bot/README.zh.md) |
-| **企业微信应用** | 中等（corp credentials） | Webhook | [指南](docs/channels/wecom/wecom_app/README.zh.md) |
-| **企业微信 AI 机器人** | 中等（token + AES key） | WebSocket / Webhook | [指南](docs/channels/wecom/wecom_aibot/README.zh.md) |
+| **企业微信** | 简单（扫码登录或手动配置） | WebSocket | [指南](docs/channels/wecom/README.zh.md) |
+| **VK** | 简单（群组 token） | Long Poll | [指南](docs/channels/vk/README.md) |
 | **IRC** | 中等（server + nick） | IRC 协议 | [指南](docs/zh/chat-apps.md#irc) |
 | **OneBot** | 中等（WebSocket URL） | OneBot v11 | [指南](docs/channels/onebot/README.zh.md) |
 | **MaixCam** | 简单（启用即可） | TCP socket | [指南](docs/channels/maixcam/README.zh.md) |
@@ -433,6 +471,8 @@ PicoClaw 通过 `model_list` 配置支持 30+ LLM Provider，使用 `协议/模�
 | **Pico Client** | 简单（WebSocket URL） | WebSocket | 内置 |
 
 > 所有基于 Webhook 的 Channel 共用同一个 Gateway HTTP 服务器（`gateway.host`:`gateway.port`，默认 `127.0.0.1:18790`）。飞书使用 WebSocket/SDK 模式，不使用共享 HTTP 服务器。
+
+> 日志详细程度通过 `gateway.log_level` 控制（默认：`warn`）。支持的值：`debug`、`info`、`warn`、`error`、`fatal`。也可通过 `PICOCLAW_LOG_LEVEL` 环境变量设置。详见[配置指南](docs/zh/configuration.md#gateway-日志等级)。
 
 详细 Channel 配置说明请参阅 [聊天应用配置](docs/zh/chat-apps.md)。
 
@@ -576,7 +616,6 @@ Discord: <https://discord.gg/V4sAZ9XWpN>
 
 WeChat:
 <img src="assets/wechat.png" alt="WeChat group QR code" width="512">
-
 
 
 

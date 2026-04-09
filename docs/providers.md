@@ -11,10 +11,12 @@
 | ------------ | --------------------------------------- | ------------------------------------------------------------ |
 | `gemini`     | LLM (Gemini direct)                     | [aistudio.google.com](https://aistudio.google.com)           |
 | `zhipu`      | LLM (Zhipu direct)                      | [bigmodel.cn](https://bigmodel.cn)                           |
+| `zai-coding` | LLM (Z.AI Coding Plan)                | [z.ai](https://z.ai/manage-apikey/apikey-list)           |
 | `volcengine` | LLM(Volcengine direct)                  | [volcengine.com](https://www.volcengine.com/activity/codingplan?utm_campaign=PicoClaw&utm_content=PicoClaw&utm_medium=devrel&utm_source=OWO&utm_term=PicoClaw)                 |
 | `openrouter` | LLM (recommended, access to all models) | [openrouter.ai](https://openrouter.ai)                       |
 | `anthropic`  | LLM (Claude direct)                     | [console.anthropic.com](https://console.anthropic.com)       |
 | `openai`     | LLM (GPT direct)                        | [platform.openai.com](https://platform.openai.com)           |
+| `venice`     | LLM (Venice AI direct)                  | [venice.ai](https://venice.ai)                               |
 | `deepseek`   | LLM (DeepSeek direct)                   | [platform.deepseek.com](https://platform.deepseek.com)       |
 | `qwen`       | LLM (Qwen direct)                       | [dashscope.console.aliyun.com](https://dashscope.console.aliyun.com) |
 | `groq`       | LLM + **Voice transcription** (Whisper) | [console.groq.com](https://console.groq.com)                 |
@@ -45,8 +47,10 @@ This design also enables **multi-agent support** with flexible provider selectio
 | Vendor              | `model` Prefix    | Default API Base                                    | Protocol  | API Key                                                          |
 | ------------------- | ----------------- |-----------------------------------------------------| --------- | ---------------------------------------------------------------- |
 | **OpenAI**          | `openai/`         | `https://api.openai.com/v1`                         | OpenAI    | [Get Key](https://platform.openai.com)                           |
+| **Venice AI**       | `venice/`         | `https://api.venice.ai/api/v1`                      | OpenAI    | [Get Key](https://venice.ai)                                     |
 | **Anthropic**       | `anthropic/`      | `https://api.anthropic.com/v1`                      | Anthropic | [Get Key](https://console.anthropic.com)                         |
 | **智谱 AI (GLM)**   | `zhipu/`          | `https://open.bigmodel.cn/api/paas/v4`              | OpenAI    | [Get Key](https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys) |
+| **Z.AI Coding Plan** | `openai/`         | `https://api.z.ai/api/coding/paas/v4`              | OpenAI    | [Get Key](https://z.ai/manage-apikey/apikey-list) |
 | **DeepSeek**        | `deepseek/`       | `https://api.deepseek.com/v1`                       | OpenAI    | [Get Key](https://platform.deepseek.com)                         |
 | **Google Gemini**   | `gemini/`         | `https://generativelanguage.googleapis.com/v1beta`  | OpenAI    | [Get Key](https://aistudio.google.com/api-keys)                  |
 | **Groq**            | `groq/`           | `https://api.groq.com/openai/v1`                    | OpenAI    | [Get Key](https://console.groq.com)                              |
@@ -54,6 +58,7 @@ This design also enables **multi-agent support** with flexible provider selectio
 | **通义千问 (Qwen)** | `qwen/`           | `https://dashscope.aliyuncs.com/compatible-mode/v1` | OpenAI    | [Get Key](https://dashscope.console.aliyun.com)                  |
 | **NVIDIA**          | `nvidia/`         | `https://integrate.api.nvidia.com/v1`               | OpenAI    | [Get Key](https://build.nvidia.com)                              |
 | **Ollama**          | `ollama/`         | `http://localhost:11434/v1`                         | OpenAI    | Local (no key needed)                                            |
+| **LM Studio**       | `lmstudio/`       | `http://localhost:1234/v1`                          | OpenAI    | Optional (local default: no key)                                 |
 | **OpenRouter**      | `openrouter/`     | `https://openrouter.ai/api/v1`                      | OpenAI    | [Get Key](https://openrouter.ai/keys)                            |
 | **LiteLLM Proxy**   | `litellm/`        | `http://localhost:4000/v1`                          | OpenAI    | Your LiteLLM proxy key                                            |
 | **VLLM**            | `vllm/`           | `http://localhost:8000/v1`                          | OpenAI    | Local                                                            |
@@ -77,22 +82,22 @@ This design also enables **multi-agent support** with flexible provider selectio
     {
       "model_name": "ark-code-latest",
       "model": "volcengine/ark-code-latest",
-      "api_key": "sk-your-api-key"
+      "api_keys": ["sk-your-api-key"]
     },
     {
       "model_name": "gpt-5.4",
       "model": "openai/gpt-5.4",
-      "api_key": "sk-your-openai-key"
+      "api_keys": ["sk-your-openai-key"]
     },
     {
       "model_name": "claude-sonnet-4.6",
       "model": "anthropic/claude-sonnet-4.6",
-      "api_key": "sk-ant-your-key"
+      "api_keys": ["sk-ant-your-key"]
     },
     {
       "model_name": "glm-4.7",
       "model": "zhipu/glm-4.7",
-      "api_key": "your-zhipu-key"
+      "api_keys": ["your-zhipu-key"]
     }
   ],
   "agents": {
@@ -102,6 +107,25 @@ This design also enables **multi-agent support** with flexible provider selectio
   }
 }
 ```
+
+#### `model_list` Entry Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `model_name` | string | Yes | Unique name used to reference this model in agent config |
+| `model` | string | Yes | Vendor/model identifier (e.g., `openai/gpt-5.4`, `azure/gpt-5.4`, `anthropic/claude-sonnet-4.6`) |
+| `api_keys` | string[] | Yes* | API key(s) for authentication. Multiple keys enable per-request rotation. Not required for local providers (Ollama, LM Studio, VLLM) |
+| `api_base` | string | No | Override the default API endpoint URL |
+| `proxy` | string | No | HTTP proxy URL for this model entry |
+| `user_agent` | string | No | Custom `User-Agent` header sent with API requests (supported by OpenAI-compatible, Anthropic, and Azure providers) |
+| `request_timeout` | int | No | Request timeout in seconds (default varies by provider) |
+| `max_tokens_field` | string | No | Override the max tokens field name in request body (e.g., `max_completion_tokens` for o1 models) |
+| `thinking_level` | string | No | Extended thinking level: `off`, `low`, `medium`, `high`, `xhigh`, or `adaptive` |
+| `extra_body` | object | No | Additional fields to inject into every request body |
+| `custom_headers` | object | No | Additional HTTP headers to inject into every request (e.g., `{"X-Source":"coding-plan"}`). If a key matches a built-in header, the custom value overrides the built-in one (e.g., `Authorization`, `User-Agent`, `Content-Type`, `Accept`). |
+| `rpm` | int | No | Per-minute request rate limit |
+| `fallbacks` | string[] | No | Fallback model names for automatic failover |
+| `enabled` | bool | No | Whether this model entry is active (default: `true`) |
 
 #### Voice Transcription
 
@@ -115,7 +139,7 @@ If `voice.model_name` is not configured, PicoClaw will continue to fall back to 
     {
       "model_name": "voice-gemini",
       "model": "gemini/gemini-2.5-flash",
-      "api_key": "your-gemini-key"
+      "api_keys": ["your-gemini-key"]
     }
   ],
   "voice": {
@@ -138,7 +162,7 @@ If `voice.model_name` is not configured, PicoClaw will continue to fall back to 
 {
   "model_name": "gpt-5.4",
   "model": "openai/gpt-5.4",
-  "api_key": "sk-..."
+  "api_keys": ["sk-..."]
 }
 ```
 
@@ -148,7 +172,7 @@ If `voice.model_name` is not configured, PicoClaw will continue to fall back to 
 {
   "model_name": "ark-code-latest",
   "model": "volcengine/ark-code-latest",
-  "api_key": "sk-..."
+  "api_keys": ["sk-..."]
 }
 ```
 
@@ -158,7 +182,18 @@ If `voice.model_name` is not configured, PicoClaw will continue to fall back to 
 {
   "model_name": "glm-4.7",
   "model": "zhipu/glm-4.7",
-  "api_key": "your-key"
+  "api_keys": ["your-key"]
+}
+```
+
+**Z.AI Coding Plan (GLM)**
+> Z.AI and 智谱 AI are two brands of the same provider. For the Z.AI Coding Plan use the `openai` model key and the api base as follows, rather than the zhipu config
+```json
+{
+  "model_name": "glm-4.7",
+  "model": "openai/glm-4.7",
+  "api_keys": ["your-z.ai-key"],
+  "api_base": "https://api.z.ai/api/coding/paas/v4"
 }
 ```
 
@@ -168,7 +203,7 @@ If `voice.model_name` is not configured, PicoClaw will continue to fall back to 
 {
   "model_name": "deepseek-chat",
   "model": "deepseek/deepseek-chat",
-  "api_key": "sk-..."
+  "api_keys": ["sk-..."]
 }
 ```
 
@@ -178,7 +213,7 @@ If `voice.model_name` is not configured, PicoClaw will continue to fall back to 
 {
   "model_name": "claude-sonnet-4.6",
   "model": "anthropic/claude-sonnet-4.6",
-  "api_key": "sk-ant-your-key"
+  "api_keys": ["sk-ant-your-key"]
 }
 ```
 
@@ -192,7 +227,7 @@ For direct Anthropic API access or custom endpoints that only support Anthropic'
 {
   "model_name": "claude-opus-4-6",
   "model": "anthropic-messages/claude-opus-4-6",
-  "api_key": "sk-ant-your-key",
+  "api_keys": ["sk-ant-your-key"],
   "api_base": "https://api.anthropic.com"
 }
 ```
@@ -213,6 +248,18 @@ For direct Anthropic API access or custom endpoints that only support Anthropic'
 }
 ```
 
+**LM Studio (local)**
+
+```json
+{
+  "model_name": "lmstudio-local",
+  "model": "lmstudio/openai/gpt-oss-20b"
+}
+```
+
+`api_base` defaults to `http://localhost:1234/v1`. API key is optional unless your LM Studio server enables authentication.<br/>
+PicoClaw sends OpenAI-compatible requests to LM Studio, and strips the `lmstudio/` prefix before sending requests, so `lmstudio/openai/gpt-oss-20b` sends `openai/gpt-oss-20b` to the LM Studio server.
+
 **Custom Proxy/API**
 
 ```json
@@ -220,7 +267,8 @@ For direct Anthropic API access or custom endpoints that only support Anthropic'
   "model_name": "my-custom-model",
   "model": "openai/custom-model",
   "api_base": "https://my-proxy.com/v1",
-  "api_key": "sk-...",
+  "api_keys": ["sk-..."],
+  "user_agent": "MyApp/1.0",
   "request_timeout": 300
 }
 ```
@@ -232,11 +280,26 @@ For direct Anthropic API access or custom endpoints that only support Anthropic'
   "model_name": "lite-gpt4",
   "model": "litellm/lite-gpt4",
   "api_base": "http://localhost:4000/v1",
-  "api_key": "sk-..."
+  "api_keys": ["sk-..."]
 }
 ```
 
 PicoClaw strips only the outer `litellm/` prefix before sending the request, so proxy aliases like `litellm/lite-gpt4` send `lite-gpt4`, while `litellm/openai/gpt-4o` sends `openai/gpt-4o`.
+
+**Z.AI Coding Plan**
+
+If the standard Zhipu endpoint (`https://open.bigmodel.cn/api/paas/v4`) returns 429 (code 1113: insufficient balance), try using the Z.AI Coding Plan endpoint instead:
+
+```json
+{
+  "model_name": "glm-4.7",
+  "model": "openai/glm-4.7",
+  "api_keys": ["your-zhipu-api-key"],
+  "api_base": "https://api.z.ai/api/coding/paas/v4"
+}
+```
+
+**Note:** The Z.AI Coding Plan endpoint and standard Zhipu endpoint use the same API key format but have separate billing. If you encounter 429 errors with the standard Zhipu endpoint, the Z.AI Coding Plan endpoint may have available balance.
 
 #### Load Balancing
 
@@ -249,21 +312,60 @@ Configure multiple endpoints for the same model name—PicoClaw will automatical
       "model_name": "gpt-5.4",
       "model": "openai/gpt-5.4",
       "api_base": "https://api1.example.com/v1",
-      "api_key": "sk-key1"
+      "api_keys": ["sk-key1"]
     },
     {
       "model_name": "gpt-5.4",
       "model": "openai/gpt-5.4",
       "api_base": "https://api2.example.com/v1",
-      "api_key": "sk-key2"
+      "api_keys": ["sk-key2"]
     }
   ]
 }
 ```
 
+#### Automatic Model Failover (Cascade)
+
+PicoClaw already supports automatic failover when you configure `primary` + `fallbacks` in the agent model settings.
+The runtime fallback chain retries the next candidate for retriable failures such as HTTP `429`, quota/rate-limit errors, and timeout errors.
+It also applies cooldown tracking per candidate to avoid immediately retrying a recently failed target.
+
+```json
+{
+  "model_list": [
+    {
+      "model_name": "qwen-main",
+      "model": "openai/qwen3.5:cloud",
+      "api_base": "https://api.example.com/v1",
+      "api_keys": ["sk-main"]
+    },
+    {
+      "model_name": "deepseek-backup",
+      "model": "deepseek/deepseek-chat",
+      "api_keys": ["sk-backup-1"]
+    },
+    {
+      "model_name": "gemini-backup",
+      "model": "gemini/gemini-2.5-flash",
+      "api_keys": ["sk-backup-2"]
+    }
+  ],
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "qwen-main",
+        "fallbacks": ["deepseek-backup", "gemini-backup"]
+      }
+    }
+  }
+}
+```
+
+If you use key-level failover for the same model, PicoClaw can chain through additional key-backed candidates before moving to cross-model backups.
+
 #### Migration from Legacy `providers` Config
 
-The old `providers` configuration is **deprecated** but still supported for backward compatibility.
+The old `providers` configuration is **deprecated** and has been removed in V2. Existing V0/V1 configs are auto-migrated.
 
 **Old Config (deprecated):**
 
@@ -288,11 +390,12 @@ The old `providers` configuration is **deprecated** but still supported for back
 
 ```json
 {
+  "version": 2,
   "model_list": [
     {
       "model_name": "glm-4.7",
       "model": "zhipu/glm-4.7",
-      "api_key": "your-key"
+      "api_keys": ["your-key"]
     }
   ],
   "agents": {

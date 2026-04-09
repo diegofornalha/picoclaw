@@ -70,12 +70,12 @@ General settings for fetching and processing webpage content.
 
 Baidu Search uses the [Qianfan AI Search API](https://cloud.baidu.com/doc/qianfan-api/s/Wmbq4z7e5), which is AI-powered and optimized for Chinese-language queries.
 
-| Config        | Type   | Default                                                          | Description               |
-|---------------|--------|------------------------------------------------------------------|---------------------------|
-| `enabled`     | bool   | false                                                            | Enable Baidu Search       |
-| `api_key`     | string | -                                                                | Qianfan API key           |
-| `base_url`    | string | `https://qianfan.baidubce.com/v2/ai_search/web_search`          | Baidu Search API URL      |
-| `max_results` | int    | 10                                                               | Maximum number of results |
+| Config        | Type   | Default                                                | Description               |
+|---------------|--------|--------------------------------------------------------|---------------------------|
+| `enabled`     | bool   | false                                                  | Enable Baidu Search       |
+| `api_key`     | string | -                                                      | Qianfan API key           |
+| `base_url`    | string | `https://qianfan.baidubce.com/v2/ai_search/web_search` | Baidu Search API URL      |
+| `max_results` | int    | 5                                                      | Maximum number of results |
 
 ```json
 {
@@ -107,25 +107,25 @@ Baidu Search uses the [Qianfan AI Search API](https://cloud.baidu.com/doc/qianfa
 | `enabled`     | bool   | false   | Enable Tavily search      |
 | `api_key`     | string | -       | Tavily API key            |
 | `base_url`    | string | -       | Custom Tavily API base URL |
-| `max_results` | int    | 0       | Maximum number of results (0 = default) |
+| `max_results` | int    | 5       | Maximum number of results |
 
 ### SearXNG
 
-| Config        | Type   | Default                  | Description               |
-|---------------|--------|--------------------------|---------------------------|
-| `enabled`     | bool   | false                    | Enable SearXNG search     |
-| `base_url`    | string | `http://localhost:8888`  | SearXNG instance URL      |
-| `max_results` | int    | 5                        | Maximum number of results |
+| Config        | Type   | Default                 | Description               |
+|---------------|--------|-------------------------|---------------------------|
+| `enabled`     | bool   | false                   | Enable SearXNG search     |
+| `base_url`    | string | `http://localhost:8888` | SearXNG instance URL      |
+| `max_results` | int    | 5                       | Maximum number of results |
 
 ### GLM Search
 
-| Config          | Type   | Default                                              | Description               |
-|-----------------|--------|------------------------------------------------------|---------------------------|
-| `enabled`       | bool   | false                                                | Enable GLM Search         |
-| `api_key`       | string | -                                                    | GLM API key               |
-| `base_url`      | string | `https://open.bigmodel.cn/api/paas/v4/web_search`   | GLM Search API URL        |
-| `search_engine` | string | `search_std`                                         | Search engine type        |
-| `max_results`   | int    | 5                                                    | Maximum number of results |
+| Config          | Type   | Default                                           | Description               |
+|-----------------|--------|---------------------------------------------------|---------------------------|
+| `enabled`       | bool   | false                                             | Enable GLM Search         |
+| `api_key`       | string | -                                                 | GLM API key               |
+| `base_url`      | string | `https://open.bigmodel.cn/api/paas/v4/web_search` | GLM Search API URL        |
+| `search_engine` | string | `search_std`                                      | Search engine type        |
+| `max_results`   | int    | 5                                                 | Maximum number of results |
 
 ### Additional Web Settings
 
@@ -133,6 +133,28 @@ Baidu Search uses the [Qianfan AI Search API](https://cloud.baidu.com/doc/qianfa
 |--------------------------|----------|---------|----------------------------------------------------------------|
 | `prefer_native`          | bool     | true    | Prefer provider's native search over configured search engines |
 | `private_host_whitelist` | string[] | `[]`    | Private/internal hosts allowed for web fetching                |
+
+### `web_search` Tool Parameters
+
+At runtime, the `web_search` tool accepts the following parameters:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `query` | string | yes | Search query string |
+| `count` | integer | no | Number of results to return. Default: `10`, max: `10` |
+| `range` | string | no | Optional time filter: `d` (day), `w` (week), `m` (month), `y` (year) |
+
+If `range` is omitted, PicoClaw performs an unrestricted search.
+
+### Example `web_search` Call
+
+```json
+{
+  "query": "ai agent news",
+  "count": 10,
+  "range": "w"
+}
+```
 
 ## Exec Tool
 
@@ -226,8 +248,11 @@ The cron tool is used for scheduling periodic tasks.
 
 | Config                 | Type | Default | Description                                    |
 |------------------------|------|---------|------------------------------------------------|
+| `enabled`              | bool | true    | Register the agent-facing cron tool            |
+| `allow_command`        | bool | true    | Allow command jobs without extra confirmation  |
 | `exec_timeout_minutes` | int  | 5       | Execution timeout in minutes, 0 means no limit |
-| `allow_command`        | bool | false   | Allow cron tasks to execute shell commands      |
+
+For schedule types, execution modes (`deliver`, agent turn, and command jobs), persistence, and the current command-security gates, see [Scheduled Tasks and Cron Jobs](cron.md).
 
 ## MCP Tool
 
@@ -503,6 +528,9 @@ For example:
 - `PICOCLAW_TOOLS_EXEC_ENABLE_DENY_PATTERNS=false`
 - `PICOCLAW_TOOLS_CRON_EXEC_TIMEOUT_MINUTES=10`
 - `PICOCLAW_TOOLS_MCP_ENABLED=true`
+- `PICOCLAW_TOOLS_MCP_MAX_INLINE_TEXT_CHARS=16384`
 
 Note: Nested map-style config (for example `tools.mcp.servers.<name>.*`) is configured in `config.json` rather than
 environment variables.
+
+For MCP tools, `tools.mcp.max_inline_text_chars` controls how much text result is kept inline in model context. The threshold is counted in Unicode characters (Go runes), not bytes. For example, `16384` means up to 16,384 characters inline, which may occupy more than 16 KB for multibyte text such as CJK. Above this threshold, PicoClaw saves the MCP text result as a local artifact in the agent workspace and gives the model a short note plus a structured `[file:...]` artifact path instead of injecting the full payload into context.
