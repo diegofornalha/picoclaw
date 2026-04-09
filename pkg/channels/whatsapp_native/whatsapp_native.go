@@ -63,6 +63,10 @@ type WhatsAppNativeChannel struct {
 	loggedOut    atomic.Bool    // set when session is permanently invalid (LoggedOut, StreamReplaced, etc.)
 	wg           sync.WaitGroup // tracks background goroutines (QR handler, reconnect)
 
+	// Presence tracking
+	presenceMu   sync.RWMutex
+	presenceMap  map[string]*PresenceInfo // JID string → presence info
+
 	// QRCallback is an optional hook called when QR login events occur.
 	// Used by the WhatsApp pool to intercept QR codes for the web UI.
 	// Parameters: event ("code", "timeout", etc.) and code (QR data, only for "code" event).
@@ -331,6 +335,8 @@ func (c *WhatsAppNativeChannel) eventHandler(evt any) {
 	case *events.ClientOutdated:
 		c.loggedOut.Store(true)
 		logger.ErrorCF("whatsapp", "WhatsApp client outdated — update whatsmeow required", nil)
+	case *events.Presence:
+		c.handlePresenceEvent(v)
 	case *events.Disconnected:
 		if c.OnDisconnect != nil {
 			c.OnDisconnect()
@@ -440,6 +446,150 @@ func (c *WhatsAppNativeChannel) handleIncoming(evt *events.Message) {
 	}
 	content = utils.SanitizeMessageContent(content)
 
+	// Detect media messages that have no text content
+	if content == "" {
+		switch {
+		case evt.Message.StickerMessage != nil:
+			// Try to download and save the sticker
+			c.mu.Lock()
+			client := c.client
+			c.mu.Unlock()
+			if client != nil {
+				if data, err := client.Download(c.runCtx, evt.Message.StickerMessage); err == nil {
+					stickerDir := filepath.Join(filepath.Dir(c.storePath), "media", "stickers")
+					_ = os.MkdirAll(stickerDir, 0755)
+					stickerPath := filepath.Join(stickerDir, evt.Info.ID+".webp")
+					if err := os.WriteFile(stickerPath, data, 0644); err == nil {
+						content = "[figurinha salva: " + stickerPath + "] Perguntar ao usuario qual nome dar para a figurinha."
+					} else {
+						content = "[sticker recebido, erro ao salvar]"
+					}
+				} else {
+					content = "[sticker recebido, erro ao baixar]"
+				}
+			} else {
+				content = "[sticker recebido]"
+			}
+		case evt.Message.ImageMessage != nil:
+			caption := evt.Message.ImageMessage.GetCaption()
+			c.mu.Lock()
+			cl := c.client
+			c.mu.Unlock()
+			if cl != nil {
+				if data, err := cl.Download(c.runCtx, evt.Message.ImageMessage); err == nil {
+					mediaDir := filepath.Join(filepath.Dir(c.storePath), "media", "images")
+					_ = os.MkdirAll(mediaDir, 0755)
+					ext := ".jpg"
+					if mime := evt.Message.ImageMessage.GetMimetype(); strings.Contains(mime, "png") {
+						ext = ".png"
+					}
+					mediaPath := filepath.Join(mediaDir, evt.Info.ID+ext)
+					if err := os.WriteFile(mediaPath, data, 0644); err == nil {
+						if caption != "" {
+							content = "[imagem salva: " + mediaPath + "] " + caption
+						} else {
+							content = "[imagem salva: " + mediaPath + "]"
+						}
+					}
+				}
+			}
+			if content == "" {
+				if caption != "" {
+					content = "[imagem] " + caption
+				} else {
+					content = "[imagem recebida]"
+				}
+			}
+		case evt.Message.AudioMessage != nil:
+			c.mu.Lock()
+			cl := c.client
+			c.mu.Unlock()
+			if cl != nil {
+				if data, err := cl.Download(c.runCtx, evt.Message.AudioMessage); err == nil {
+					mediaDir := filepath.Join(filepath.Dir(c.storePath), "media", "audio")
+					_ = os.MkdirAll(mediaDir, 0755)
+					ext := ".ogg"
+					if evt.Message.AudioMessage.GetPTT() {
+						ext = ".ogg"
+					}
+					mediaPath := filepath.Join(mediaDir, evt.Info.ID+ext)
+					if err := os.WriteFile(mediaPath, data, 0644); err == nil {
+						if evt.Message.AudioMessage.GetPTT() {
+							content = "[audio de voz salvo: " + mediaPath + "]"
+						} else {
+							content = "[audio salvo: " + mediaPath + "]"
+						}
+					}
+				}
+			}
+			if content == "" {
+				if evt.Message.AudioMessage.GetPTT() {
+					content = "[audio de voz recebido]"
+				} else {
+					content = "[audio recebido]"
+				}
+			}
+		case evt.Message.VideoMessage != nil:
+			caption := evt.Message.VideoMessage.GetCaption()
+			c.mu.Lock()
+			cl := c.client
+			c.mu.Unlock()
+			if cl != nil {
+				if data, err := cl.Download(c.runCtx, evt.Message.VideoMessage); err == nil {
+					mediaDir := filepath.Join(filepath.Dir(c.storePath), "media", "videos")
+					_ = os.MkdirAll(mediaDir, 0755)
+					mediaPath := filepath.Join(mediaDir, evt.Info.ID+".mp4")
+					if err := os.WriteFile(mediaPath, data, 0644); err == nil {
+						if caption != "" {
+							content = "[video salvo: " + mediaPath + "] " + caption
+						} else {
+							content = "[video salvo: " + mediaPath + "]"
+						}
+					}
+				}
+			}
+			if content == "" {
+				if caption != "" {
+					content = "[video] " + caption
+				} else {
+					content = "[video recebido]"
+				}
+			}
+		case evt.Message.DocumentMessage != nil:
+			filename := evt.Message.DocumentMessage.GetFileName()
+			c.mu.Lock()
+			cl := c.client
+			c.mu.Unlock()
+			if cl != nil {
+				if data, err := cl.Download(c.runCtx, evt.Message.DocumentMessage); err == nil {
+					mediaDir := filepath.Join(filepath.Dir(c.storePath), "media", "docs")
+					_ = os.MkdirAll(mediaDir, 0755)
+					saveName := evt.Info.ID
+					if filename != "" {
+						saveName = filename
+					}
+					mediaPath := filepath.Join(mediaDir, saveName)
+					if err := os.WriteFile(mediaPath, data, 0644); err == nil {
+						content = "[documento salvo: " + mediaPath + "]"
+					}
+				}
+			}
+			if content == "" {
+				if filename != "" {
+					content = "[documento] " + filename
+				} else {
+					content = "[documento recebido]"
+				}
+			}
+		case evt.Message.ContactMessage != nil:
+			name := evt.Message.ContactMessage.GetDisplayName()
+			content = "[contato] " + name
+		case evt.Message.LocationMessage != nil:
+			content = "[localizacao recebida]"
+		case evt.Message.ReactionMessage != nil:
+			content = "[reacao] " + evt.Message.ReactionMessage.GetText()
+		}
+	}
 
 	if content == "" {
 		return
@@ -950,6 +1100,436 @@ func (c *WhatsAppNativeChannel) SendToNewsletter(ctx context.Context, newsletter
 	msg := &waE2E.Message{Conversation: proto.String(content)}
 	_, err = client.SendMessage(ctx, jid, msg)
 	return err
+}
+
+// GroupInfo holds basic info about a WhatsApp group.
+type GroupInfo struct {
+	JID          string `json:"jid"`
+	Name         string `json:"name"`
+	Topic        string `json:"topic,omitempty"`
+	Participants int    `json:"participants"`
+}
+
+// GetJoinedGroups returns all groups the bot is a member of.
+func (c *WhatsAppNativeChannel) GetJoinedGroups(ctx context.Context) ([]GroupInfo, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, fmt.Errorf("whatsapp not connected")
+	}
+	groups, err := client.GetJoinedGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]GroupInfo, len(groups))
+	for i, g := range groups {
+		result[i] = GroupInfo{
+			JID:          g.JID.String(),
+			Name:         g.Name,
+			Topic:        g.Topic,
+			Participants: len(g.Participants),
+		}
+	}
+	return result, nil
+}
+
+// SendSticker sends a WebP sticker to a contact or group.
+func (c *WhatsAppNativeChannel) SendSticker(ctx context.Context, chatID string, webpData []byte) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	resp, err := client.Upload(ctx, webpData, whatsmeow.MediaImage)
+	if err != nil {
+		return fmt.Errorf("upload sticker: %w", err)
+	}
+	msg := &waE2E.Message{
+		StickerMessage: &waE2E.StickerMessage{
+			URL:           proto.String(resp.URL),
+			DirectPath:    proto.String(resp.DirectPath),
+			MediaKey:      resp.MediaKey,
+			Mimetype:      proto.String("image/webp"),
+			FileEncSHA256: resp.FileEncSHA256,
+			FileSHA256:    resp.FileSHA256,
+			FileLength:    proto.Uint64(resp.FileLength),
+		},
+	}
+	_, err = client.SendMessage(ctx, jid, msg)
+	return err
+}
+
+// DownloadSticker downloads a received sticker and returns the WebP bytes.
+func (c *WhatsAppNativeChannel) DownloadSticker(ctx context.Context, evt *events.Message) ([]byte, error) {
+	if evt.Message.StickerMessage == nil {
+		return nil, fmt.Errorf("not a sticker message")
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, fmt.Errorf("whatsapp not connected")
+	}
+	return client.Download(ctx, evt.Message.StickerMessage)
+}
+
+// BlockContact blocks a contact on WhatsApp.
+func (c *WhatsAppNativeChannel) BlockContact(ctx context.Context, chatID string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	_, err = client.UpdateBlocklist(ctx, jid, events.BlocklistChangeActionBlock)
+	return err
+}
+
+// UnblockContact unblocks a contact on WhatsApp.
+func (c *WhatsAppNativeChannel) UnblockContact(ctx context.Context, chatID string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	_, err = client.UpdateBlocklist(ctx, jid, events.BlocklistChangeActionUnblock)
+	return err
+}
+
+// GetBlocklist returns the list of blocked contacts.
+func (c *WhatsAppNativeChannel) GetBlocklist(ctx context.Context) ([]string, error) {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, fmt.Errorf("whatsapp not connected")
+	}
+	list, err := client.GetBlocklist(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, len(list.JIDs))
+	for i, jid := range list.JIDs {
+		result[i] = jid.String()
+	}
+	return result, nil
+}
+
+// SetBio updates the "about" status message of the bot's WhatsApp profile.
+func (c *WhatsAppNativeChannel) SetBio(ctx context.Context, msg string) error {
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	return client.SetStatusMessage(ctx, msg)
+}
+
+// GetSubGroups returns all subgroups of a community.
+func (c *WhatsAppNativeChannel) GetSubGroups(ctx context.Context, communityJID string) ([]GroupInfo, error) {
+	jid, err := parseJID(communityJID)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return nil, fmt.Errorf("whatsapp not connected")
+	}
+	subs, err := client.GetSubGroups(ctx, jid)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]GroupInfo, len(subs))
+	for i, s := range subs {
+		result[i] = GroupInfo{
+			JID:  s.JID.String(),
+			Name: s.GroupName.Name,
+		}
+	}
+	return result, nil
+}
+
+// SendInteractive sends an interactive message with native flow buttons.
+func (c *WhatsAppNativeChannel) SendInteractive(ctx context.Context, chatID string, title string, body string, footer string, buttons []map[string]string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	nfButtons := make([]*waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton, len(buttons))
+	for i, b := range buttons {
+		nfButtons[i] = &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{
+			Name:             proto.String(b["name"]),
+			ButtonParamsJSON: proto.String(b["params"]),
+		}
+	}
+	msg := &waE2E.Message{
+		InteractiveMessage: &waE2E.InteractiveMessage{
+			Header: &waE2E.InteractiveMessage_Header{
+				Title:              proto.String(title),
+				HasMediaAttachment: proto.Bool(false),
+			},
+			Body: &waE2E.InteractiveMessage_Body{
+				Text: proto.String(body),
+			},
+			Footer: &waE2E.InteractiveMessage_Footer{
+				Text: proto.String(footer),
+			},
+			InteractiveMessage: &waE2E.InteractiveMessage_NativeFlowMessage_{
+				NativeFlowMessage: &waE2E.InteractiveMessage_NativeFlowMessage{
+					Buttons:        nfButtons,
+					MessageVersion: proto.Int32(1),
+				},
+			},
+		},
+	}
+	_, err = client.SendMessage(ctx, jid, msg)
+	return err
+}
+
+// SendButtons sends a message with clickable buttons.
+func (c *WhatsAppNativeChannel) SendButtons(ctx context.Context, chatID string, text string, footer string, buttons []map[string]string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	btnList := make([]*waE2E.ButtonsMessage_Button, len(buttons))
+	for i, b := range buttons {
+		btnList[i] = &waE2E.ButtonsMessage_Button{
+			ButtonID: proto.String(b["id"]),
+			ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
+				DisplayText: proto.String(b["text"]),
+			},
+			Type: waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
+		}
+	}
+	msg := &waE2E.Message{
+		ButtonsMessage: &waE2E.ButtonsMessage{
+			ContentText: proto.String(text),
+			FooterText:  proto.String(footer),
+			Buttons:     btnList,
+			HeaderType:  waE2E.ButtonsMessage_EMPTY.Enum(),
+		},
+	}
+	_, err = client.SendMessage(ctx, jid, msg)
+	return err
+}
+
+// SetDisappearingTimer sets the disappearing messages timer for a chat.
+// Valid values: "off", "24h", "7d", "90d"
+func (c *WhatsAppNativeChannel) SetDisappearingTimer(ctx context.Context, chatID string, timer string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	duration, ok := whatsmeow.ParseDisappearingTimerString(timer)
+	if !ok {
+		return fmt.Errorf("timer invalido: %s (use off, 24h, 7d ou 90d)", timer)
+	}
+	return client.SetDisappearingTimer(ctx, jid, duration, time.Now())
+}
+
+// SendImage sends an image to a contact or group. Supports view-once.
+func (c *WhatsAppNativeChannel) SendImage(ctx context.Context, chatID string, imageData []byte, mimetype string, caption string, viewOnce bool) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	resp, err := client.Upload(ctx, imageData, whatsmeow.MediaImage)
+	if err != nil {
+		return fmt.Errorf("upload image: %w", err)
+	}
+	if mimetype == "" {
+		mimetype = "image/jpeg"
+	}
+	imageMsg := &waE2E.ImageMessage{
+		URL:           proto.String(resp.URL),
+		DirectPath:    proto.String(resp.DirectPath),
+		MediaKey:      resp.MediaKey,
+		Mimetype:      proto.String(mimetype),
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
+		FileLength:    proto.Uint64(resp.FileLength),
+	}
+	if caption != "" {
+		imageMsg.Caption = proto.String(caption)
+	}
+	if viewOnce {
+		imageMsg.ViewOnce = proto.Bool(true)
+	}
+	_, err = client.SendMessage(ctx, jid, &waE2E.Message{ImageMessage: imageMsg})
+	return err
+}
+
+// SendVideo sends a video file to a contact or group. Supports view-once.
+func (c *WhatsAppNativeChannel) SendVideo(ctx context.Context, chatID string, videoData []byte, caption string, viewOnce bool) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	resp, err := client.Upload(ctx, videoData, whatsmeow.MediaVideo)
+	if err != nil {
+		return fmt.Errorf("upload video: %w", err)
+	}
+	videoMsg := &waE2E.VideoMessage{
+		URL:           proto.String(resp.URL),
+		DirectPath:    proto.String(resp.DirectPath),
+		MediaKey:      resp.MediaKey,
+		Mimetype:      proto.String("video/mp4"),
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
+		FileLength:    proto.Uint64(resp.FileLength),
+	}
+	if caption != "" {
+		videoMsg.Caption = proto.String(caption)
+	}
+	if viewOnce {
+		videoMsg.ViewOnce = proto.Bool(true)
+	}
+	msg := &waE2E.Message{VideoMessage: videoMsg}
+	_, err = client.SendMessage(ctx, jid, msg)
+	return err
+}
+
+// SendContact sends a vCard contact message.
+func (c *WhatsAppNativeChannel) SendContact(ctx context.Context, chatID string, name string, phone string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	vcard := fmt.Sprintf("BEGIN:VCARD\nVERSION:3.0\nFN:%s\nTEL;type=CELL;type=VOICE;waid=%s:%s\nEND:VCARD", name, phone, "+"+phone)
+	msg := &waE2E.Message{
+		ContactMessage: &waE2E.ContactMessage{
+			DisplayName: proto.String(name),
+			Vcard:       proto.String(vcard),
+		},
+	}
+	_, err = client.SendMessage(ctx, jid, msg)
+	return err
+}
+
+// SendPoll sends a poll message to a contact or group.
+// selectableCount=1 for single choice, 0 or len(options) for multiple choice.
+func (c *WhatsAppNativeChannel) SendPoll(ctx context.Context, chatID string, question string, options []string, selectableCount int) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	msg := client.BuildPollCreation(question, options, selectableCount)
+	_, err = client.SendMessage(ctx, jid, msg)
+	return err
+}
+
+// PresenceInfo holds the last known presence state of a contact.
+type PresenceInfo struct {
+	Online   bool      `json:"online"`
+	LastSeen time.Time `json:"last_seen,omitempty"`
+	Updated  time.Time `json:"updated"`
+}
+
+// SubscribePresence subscribes to presence updates for a contact.
+// Requires the bot to be marked as online first.
+func (c *WhatsAppNativeChannel) SubscribePresence(ctx context.Context, chatID string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	// Mark ourselves as online so we receive presence updates
+	_ = client.SendPresence(ctx, types.PresenceAvailable)
+	return client.SubscribePresence(ctx, jid)
+}
+
+// GetPresence returns the last known presence for a contact.
+func (c *WhatsAppNativeChannel) GetPresence(chatID string) *PresenceInfo {
+	c.presenceMu.RLock()
+	defer c.presenceMu.RUnlock()
+	if c.presenceMap == nil {
+		return nil
+	}
+	return c.presenceMap[chatID]
+}
+
+// handlePresenceEvent stores presence updates from subscribed contacts.
+func (c *WhatsAppNativeChannel) handlePresenceEvent(evt *events.Presence) {
+	jid := evt.From.ToNonAD().String()
+	info := &PresenceInfo{
+		Online:  !evt.Unavailable,
+		Updated: time.Now(),
+	}
+	if !evt.LastSeen.IsZero() {
+		info.LastSeen = evt.LastSeen
+	}
+	c.presenceMu.Lock()
+	if c.presenceMap == nil {
+		c.presenceMap = make(map[string]*PresenceInfo)
+	}
+	c.presenceMap[jid] = info
+	c.presenceMu.Unlock()
 }
 
 // parseJID converts a chat ID (phone number or JID string) to types.JID.

@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -447,6 +449,595 @@ func setupAndStartServices(
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send direct message to a WhatsApp contact
+	runningServices.ChannelManager.HandleFunc("/api/send-message", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To   string `json:"to"`
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Text == "" {
+			http.Error(w, "bad request: to and text required", http.StatusBadRequest)
+			return
+		}
+		type directSender interface {
+			Send(ctx context.Context, msg bus.OutboundMessage) ([]string, error)
+		}
+		var sender directSender
+		if ch, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if s, ok := ch.(directSender); ok {
+				sender = s
+			}
+		}
+		if sender == nil && runningServices.WAPool != nil {
+			for _, slot := range runningServices.WAPool.ConnectedSlots() {
+				sender = slot.Channel
+				break
+			}
+		}
+		if sender == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		msg := bus.OutboundMessage{
+			ChatID:  body.To,
+			Content: body.Text,
+		}
+		if _, err := sender.Send(r.Context(), msg); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: list joined WhatsApp groups
+	runningServices.ChannelManager.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		groups, err := ch.GetJoinedGroups(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(groups)
+	})
+
+	// API: send a sticker (WebP) to a WhatsApp chat
+	// Accepts either JSON with base64 data or multipart form with file
+	runningServices.ChannelManager.HandleFunc("/api/send-sticker", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var to string
+		var webpData []byte
+
+		contentType := r.Header.Get("Content-Type")
+		if strings.HasPrefix(contentType, "multipart/") {
+			// Multipart form: file upload
+			if err := r.ParseMultipartForm(2 << 20); err != nil { // 2MB max
+				http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			to = r.FormValue("to")
+			file, _, err := r.FormFile("sticker")
+			if err != nil {
+				http.Error(w, "bad request: sticker file required", http.StatusBadRequest)
+				return
+			}
+			defer file.Close()
+			webpData, err = io.ReadAll(file)
+			if err != nil {
+				http.Error(w, "failed to read file", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// JSON with base64
+			var body struct {
+				To   string `json:"to"`
+				Data string `json:"data"` // base64 encoded WebP
+				File string `json:"file"` // or local file path
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			to = body.To
+			if body.Data != "" {
+				var err error
+				webpData, err = base64.StdEncoding.DecodeString(body.Data)
+				if err != nil {
+					http.Error(w, "bad request: invalid base64", http.StatusBadRequest)
+					return
+				}
+			} else if body.File != "" {
+				var err error
+				webpData, err = os.ReadFile(body.File)
+				if err != nil {
+					http.Error(w, "bad request: cannot read file: "+err.Error(), http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		if to == "" || len(webpData) == 0 {
+			http.Error(w, "bad request: to and sticker data required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendSticker(r.Context(), to, webpData); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: block/unblock a contact
+	runningServices.ChannelManager.HandleFunc("/api/block", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To     string `json:"to"`
+			Action string `json:"action"` // "block" or "unblock"
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" {
+			http.Error(w, "bad request: to required", http.StatusBadRequest)
+			return
+		}
+		if body.Action == "" {
+			body.Action = "block"
+		}
+		var err error
+		if body.Action == "unblock" {
+			err = ch.UnblockContact(r.Context(), body.To)
+		} else {
+			err = ch.BlockContact(r.Context(), body.To)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "action": body.Action})
+	})
+
+	// API: get blocklist
+	runningServices.ChannelManager.HandleFunc("/api/blocklist", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		list, err := ch.GetBlocklist(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(list)
+	})
+
+	// API: set the bot's "about" bio message
+	runningServices.ChannelManager.HandleFunc("/api/set-bio", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			Text string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Text == "" {
+			http.Error(w, "bad request: text required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SetBio(r.Context(), body.Text); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: get subgroups of a community
+	runningServices.ChannelManager.HandleFunc("/api/community/subgroups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		communityJID := r.URL.Query().Get("jid")
+		if communityJID == "" {
+			http.Error(w, "bad request: jid query param required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		subs, err := ch.GetSubGroups(r.Context(), communityJID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(subs)
+	})
+
+	// API: send an interactive message with native flow buttons
+	runningServices.ChannelManager.HandleFunc("/api/send-interactive", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To      string              `json:"to"`
+			Title   string              `json:"title"`
+			Text    string              `json:"text"`
+			Footer  string              `json:"footer"`
+			Buttons []map[string]string `json:"buttons"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Text == "" || len(body.Buttons) == 0 {
+			http.Error(w, "bad request: to, text, and buttons required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendInteractive(r.Context(), body.To, body.Title, body.Text, body.Footer, body.Buttons); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a message with buttons
+	runningServices.ChannelManager.HandleFunc("/api/send-buttons", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To      string              `json:"to"`
+			Text    string              `json:"text"`
+			Footer  string              `json:"footer"`
+			Buttons []map[string]string `json:"buttons"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Text == "" || len(body.Buttons) == 0 {
+			http.Error(w, "bad request: to, text, and buttons required", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendButtons(r.Context(), body.To, body.Text, body.Footer, body.Buttons); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: set disappearing messages timer for a chat
+	runningServices.ChannelManager.HandleFunc("/api/set-disappearing", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			Chat  string `json:"chat"`
+			Timer string `json:"timer"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Chat == "" || body.Timer == "" {
+			http.Error(w, "bad request: chat and timer required (off, 24h, 7d, 90d)", http.StatusBadRequest)
+			return
+		}
+		if err := ch.SetDisappearingTimer(r.Context(), body.Chat, body.Timer); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "timer": body.Timer})
+	})
+
+	// API: send an image to a WhatsApp chat
+	runningServices.ChannelManager.HandleFunc("/api/send-image", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To       string `json:"to"`
+			File     string `json:"file"`
+			Caption  string `json:"caption"`
+			ViewOnce bool   `json:"view_once"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.File == "" {
+			http.Error(w, "bad request: to and file required", http.StatusBadRequest)
+			return
+		}
+		imageData, err := os.ReadFile(body.File)
+		if err != nil {
+			http.Error(w, "cannot read file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		mimetype := "image/jpeg"
+		if strings.HasSuffix(strings.ToLower(body.File), ".png") {
+			mimetype = "image/png"
+		} else if strings.HasSuffix(strings.ToLower(body.File), ".webp") {
+			mimetype = "image/webp"
+		}
+		if err := ch.SendImage(r.Context(), body.To, imageData, mimetype, body.Caption, body.ViewOnce); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a video to a WhatsApp chat
+	runningServices.ChannelManager.HandleFunc("/api/send-video", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To       string `json:"to"`
+			File     string `json:"file"`
+			Caption  string `json:"caption"`
+			ViewOnce bool   `json:"view_once"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.File == "" {
+			http.Error(w, "bad request: to and file required", http.StatusBadRequest)
+			return
+		}
+		videoData, err := os.ReadFile(body.File)
+		if err != nil {
+			http.Error(w, "cannot read file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := ch.SendVideo(r.Context(), body.To, videoData, body.Caption, body.ViewOnce); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a vCard contact to a WhatsApp chat
+	runningServices.ChannelManager.HandleFunc("/api/send-contact", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To    string `json:"to"`
+			Name  string `json:"name"`
+			Phone string `json:"phone"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Name == "" || body.Phone == "" {
+			http.Error(w, "bad request: to, name, and phone required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		if err := ch.SendContact(r.Context(), body.To, body.Name, body.Phone); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a poll to a WhatsApp contact or group
+	runningServices.ChannelManager.HandleFunc("/api/send-poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To              string   `json:"to"`
+			Question        string   `json:"question"`
+			Options         []string `json:"options"`
+			SelectableCount int      `json:"selectable_count"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Question == "" || len(body.Options) < 2 {
+			http.Error(w, "bad request: to, question, and at least 2 options required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		if err := ch.SendPoll(r.Context(), body.To, body.Question, body.Options, body.SelectableCount); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: subscribe to presence updates for a contact
+	runningServices.ChannelManager.HandleFunc("/api/presence/subscribe", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			To string `json:"to"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" {
+			http.Error(w, "bad request: to required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		if err := ch.SubscribePresence(r.Context(), body.To); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "subscribed", "to": body.To})
+	})
+
+	// API: get presence status for a contact (must subscribe first)
+	runningServices.ChannelManager.HandleFunc("/api/presence/check", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		to := r.URL.Query().Get("to")
+		if to == "" {
+			http.Error(w, "bad request: to query param required", http.StatusBadRequest)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		info := ch.GetPresence(to)
+		w.Header().Set("Content-Type", "application/json")
+		if info == nil {
+			json.NewEncoder(w).Encode(map[string]string{"status": "unknown", "to": to})
+		} else {
+			json.NewEncoder(w).Encode(info)
+		}
 	})
 
 	// API: WhatsApp pool status
