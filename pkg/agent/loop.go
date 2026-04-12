@@ -2342,7 +2342,9 @@ turnLoop:
 		if response.Content != "" && al.channelManager != nil && ts.channel != "" && !constants.IsInternalChannel(ts.channel) {
 			// Strip split markers since SendMessage bypasses the worker
 			// loop where SplitByMarker normally runs.
-			contentParts := channels.SplitByMarker(response.Content)
+			// Also strip <think> tags that some models emit inline.
+			cleanedContent := channels.StripThinkTags(response.Content)
+			contentParts := channels.SplitByMarker(cleanedContent)
 			for _, part := range contentParts {
 				_ = al.channelManager.SendMessage(ctx, bus.OutboundMessage{
 					Channel: ts.channel,

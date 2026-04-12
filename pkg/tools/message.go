@@ -3,8 +3,12 @@ package tools
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 )
+
+var thinkTagReMsg = regexp.MustCompile(`(?s)<think>.*?</think>`)
 
 type SendCallback func(channel, chatID, content, replyToMessageID string) error
 
@@ -113,6 +117,12 @@ func (t *MessageTool) Execute(ctx context.Context, args map[string]any) *ToolRes
 
 	if t.sendCallback == nil {
 		return &ToolResult{ForLLM: "Message sending not configured", IsError: true}
+	}
+
+	// Strip <think> tags that some models emit inline
+	content = strings.TrimSpace(thinkTagReMsg.ReplaceAllString(content, ""))
+	if content == "" {
+		return &ToolResult{ForLLM: "Message content is empty after cleaning"}
 	}
 
 	if err := t.sendCallback(channel, chatID, content, replyToMessageID); err != nil {

@@ -712,6 +712,25 @@ func (c *WhatsAppNativeChannel) Send(ctx context.Context, msg bus.OutboundMessag
 		waMsg = &waE2E.Message{Conversation: proto.String(msg.Content)}
 	}
 
+	// Quote original message if reply_to is set
+	if msg.ReplyToMessageID != "" {
+		ctxInfo := &waE2E.ContextInfo{
+			StanzaID:    proto.String(msg.ReplyToMessageID),
+			Participant: proto.String(msg.ChatID),
+		}
+		if waMsg.ExtendedTextMessage != nil {
+			waMsg.ExtendedTextMessage.ContextInfo = ctxInfo
+		} else {
+			// Convert Conversation to ExtendedTextMessage to support ContextInfo
+			waMsg = &waE2E.Message{
+				ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+					Text:        proto.String(msg.Content),
+					ContextInfo: ctxInfo,
+				},
+			}
+		}
+	}
+
 	if _, err = client.SendMessage(ctx, to, waMsg); err != nil {
 		return nil, fmt.Errorf("whatsapp send: %w", channels.ErrTemporary)
 	}
@@ -1435,6 +1454,43 @@ func (c *WhatsAppNativeChannel) SendVideo(ctx context.Context, chatID string, vi
 	}
 	msg := &waE2E.Message{VideoMessage: videoMsg}
 	_, err = client.SendMessage(ctx, jid, msg)
+	return err
+}
+
+// SendDocument sends a document file to a contact or group.
+func (c *WhatsAppNativeChannel) SendDocument(ctx context.Context, chatID string, docData []byte, mimetype string, filename string, caption string) error {
+	jid, err := parseJID(chatID)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	client := c.client
+	c.mu.Unlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp not connected")
+	}
+	resp, err := client.Upload(ctx, docData, whatsmeow.MediaDocument)
+	if err != nil {
+		return fmt.Errorf("upload document: %w", err)
+	}
+	if mimetype == "" {
+		mimetype = "application/octet-stream"
+	}
+	docMsg := &waE2E.DocumentMessage{
+		URL:           proto.String(resp.URL),
+		DirectPath:    proto.String(resp.DirectPath),
+		MediaKey:      resp.MediaKey,
+		Mimetype:      proto.String(mimetype),
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
+		FileLength:    proto.Uint64(resp.FileLength),
+		FileName:      proto.String(filename),
+		Title:         proto.String(filename),
+	}
+	if caption != "" {
+		docMsg.Caption = proto.String(caption)
+	}
+	_, err = client.SendMessage(ctx, jid, &waE2E.Message{DocumentMessage: docMsg})
 	return err
 }
 

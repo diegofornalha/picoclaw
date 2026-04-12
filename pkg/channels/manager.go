@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -714,6 +716,12 @@ func (m *Manager) runWorker(ctx context.Context, name string, w *channelWorker) 
 				maxLen = mlp.MaxMessageLength()
 			}
 
+			// Strip <think>...</think> tags from LLM output
+			msg.Content = StripThinkTags(msg.Content)
+			if msg.Content == "" {
+				continue
+			}
+
 			// Collect all message chunks to send
 			var chunks []string
 
@@ -741,6 +749,15 @@ func (m *Manager) runWorker(ctx context.Context, name string, w *channelWorker) 
 			return
 		}
 	}
+}
+
+// stripThinkTags removes <think>...</think> blocks from LLM output.
+// Some models (e.g. Gemini) emit inline thinking tags that should not be sent to users.
+var thinkTagRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
+func StripThinkTags(s string) string {
+	s = thinkTagRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
 }
 
 // splitByLength splits content by maxLen if needed, otherwise returns single chunk.

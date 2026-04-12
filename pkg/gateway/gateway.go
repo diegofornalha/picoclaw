@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -458,8 +459,9 @@ func setupAndStartServices(
 			return
 		}
 		var body struct {
-			To   string `json:"to"`
-			Text string `json:"text"`
+			To      string `json:"to"`
+			Text    string `json:"text"`
+			ReplyTo string `json:"reply_to,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.Text == "" {
 			http.Error(w, "bad request: to and text required", http.StatusBadRequest)
@@ -485,8 +487,9 @@ func setupAndStartServices(
 			return
 		}
 		msg := bus.OutboundMessage{
-			ChatID:  body.To,
-			Content: body.Text,
+			ChatID:           body.To,
+			Content:          body.Text,
+			ReplyToMessageID: body.ReplyTo,
 		}
 		if _, err := sender.Send(r.Context(), msg); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -866,6 +869,53 @@ func setupAndStartServices(
 			mimetype = "image/webp"
 		}
 		if err := ch.SendImage(r.Context(), body.To, imageData, mimetype, body.Caption, body.ViewOnce); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	// API: send a document to a WhatsApp chat
+	runningServices.ChannelManager.HandleFunc("/api/send-document", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var ch *whatsappnative.WhatsAppNativeChannel
+		if raw, ok := runningServices.ChannelManager.GetChannel("whatsapp_native"); ok {
+			if c, ok := raw.(*whatsappnative.WhatsAppNativeChannel); ok {
+				ch = c
+			}
+		}
+		if ch == nil {
+			http.Error(w, "whatsapp not available", http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			To       string `json:"to"`
+			File     string `json:"file"`
+			Filename string `json:"filename"`
+			Caption  string `json:"caption"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.To == "" || body.File == "" {
+			http.Error(w, "bad request: to and file required", http.StatusBadRequest)
+			return
+		}
+		docData, err := os.ReadFile(body.File)
+		if err != nil {
+			http.Error(w, "cannot read file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		filename := body.Filename
+		if filename == "" {
+			filename = filepath.Base(body.File)
+		}
+		mimetype := mime.TypeByExtension(filepath.Ext(body.File))
+		if mimetype == "" {
+			mimetype = "application/octet-stream"
+		}
+		if err := ch.SendDocument(r.Context(), body.To, docData, mimetype, filename, body.Caption); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
